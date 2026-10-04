@@ -4,7 +4,12 @@ version = "0.1.0"
 description = "Multi-agent system over A2A: an orchestrator plus specialist agents."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "a2a-sdk[http-server]>=1.2.1,<2",
+    "agentos",
+    "httpx>=0.28.1",
+    "uvicorn>=0.35",
+]
 
 [project.scripts]
 agentmesh = "agentmesh:main"
@@ -17,6 +22,7 @@ build-backend = "uv_build"
 dev = [
     "pre-commit>=4.6.2",
     "pytest>=9.1.1",
+    "pytest-asyncio>=1.2",
     "ruff>=0.16.9",
 ]
 
@@ -30,3 +36,7 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+asyncio_mode = "auto"
+
+[tool.uv.sources]
+agentos = { git = "https://github.com/yqx1412/agentos", rev = "fa82df067a696fa02782b0b7e7b598afde80f80b" }

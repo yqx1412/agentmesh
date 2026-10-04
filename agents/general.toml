@@ -1,0 +1,24 @@
+# M1: one AgentOS agent behind A2A. `uv run agentmesh serve agents/general.toml`
+name = "General Agent"
+description = "An AgentOS agent that completes tasks with tools: it reads and writes text files in its own workspace and does exact arithmetic."
+version = "0.1.0"
+port = 9101
+model = "qwen3:8b"
+kind = "plain"
+max_steps = 12
+allow = "write"
+workspace = "../workspace/general"
+
+[[skills]]
+id = "workspace_files"
+name = "Workspace files"
+description = "Reads, summarizes, transforms and writes plain-text files inside the agent's workspace. Paths are relative to that workspace; nothing outside it is reachable."
+tags = ["files", "text"]
+examples = ["Read notes.txt and write a three-line summary to summary.txt", "List the numbers in data.txt in ascending order"]
+
+[[skills]]
+id = "calculation"
+name = "Exact arithmetic"
+description = "Evaluates arithmetic expressions with a calculator tool instead of guessing."
+tags = ["math"]
+examples = ["What is 17.5% of 2,348, rounded to two decimals?"]

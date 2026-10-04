@@ -13,3 +13,5 @@ wheels/
 .env
 runs/
 *.jsonl
+# Agent workspaces (files the agents read and write)
+workspace/

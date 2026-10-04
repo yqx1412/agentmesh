@@ -3,5 +3,7 @@
 __version__ = "0.1.0"
 
 
-def main() -> None:
-    print(f"agentmesh {__version__}")
+def main(argv: list[str] | None = None) -> int:
+    from agentmesh.cli import main as cli_main
+
+    return cli_main(argv)

@@ -1,0 +1,12 @@
+# Knowledge agent tools: DomainGraph over MCP. The only agent config with a DomainGraph
+# server (tests/test_m2.py checks this). Left out on purpose: ingest_source (reads local
+# files), forget_fact and clear_scope (deletes).
+# {workspace} is agentmesh/workspace/knowledge, so this cwd is the sibling domaingraph repo.
+[mcp_servers.domaingraph]
+command = "uv"
+args = ["run", "--quiet", "domaingraph", "mcp"]
+cwd = "{workspace}/../../../domaingraph"
+tools = ["search", "get_concept", "related_concepts", "recall_facts", "list_facts", "add_fact"]
+permission = "write"
+startup_timeout = 120
+timeout = 120

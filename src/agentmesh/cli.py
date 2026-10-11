@@ -24,6 +24,13 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, help="Override the spec's port")
     serve.add_argument("--trace-dir", type=Path, help="Write an AgentOS trace per task here")
 
+    up = sub.add_parser("up", help="Start several agents, one process each (default: M2 four)")
+    up.add_argument("specs", type=Path, nargs="*", help="Agent specs (default: the specialists)")
+    up.add_argument("--agents-dir", type=Path, default=Path("agents"), help="Default: agents")
+    up.add_argument("--log-dir", type=Path, help="Default: runs/fleet/<timestamp>")
+    up.add_argument("--trace-dir", type=Path, help="Per-agent AgentOS traces under this folder")
+    up.add_argument("--ready-timeout", type=float, default=60.0, help="Seconds (default: 60)")
+
     card = sub.add_parser("card", help="Fetch and print an agent's card")
     card.add_argument("url")
 
@@ -39,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "serve":
         return _serve(args)
+    if args.command == "up":
+        return _up(args)
     if args.command == "card":
         return asyncio.run(_card(args))
     if args.command == "ask":
@@ -65,6 +74,32 @@ def _serve(args: argparse.Namespace) -> int:
     print(f"{spec.name} on {spec.url} (model {spec.model}, workspace {spec.workspace})")
     uvicorn.run(app, host=spec.host, port=spec.port, log_level="warning")
     return 0
+
+
+def _up(args: argparse.Namespace) -> int:
+    import time
+
+    from agentmesh import fleet
+    from agentmesh.spec import SpecError
+
+    paths = args.specs or fleet.default_specs(args.agents_dir)
+    log_dir = args.log_dir or Path("runs") / "fleet" / time.strftime("%Y%m%d-%H%M%S")
+    try:
+        members = fleet.plan(paths, log_dir)
+    except SpecError as exc:
+        print(f"spec error: {exc}", file=sys.stderr)
+        return 2
+    fleet.start(members, args.trace_dir)
+    try:
+        cards = fleet.wait_ready(members, args.ready_timeout)
+    except (RuntimeError, TimeoutError) as exc:
+        print(f"startup failed: {exc}", file=sys.stderr)
+        fleet.stop(members)
+        return 1
+    for m in members:
+        print(fleet.describe(m, cards[m.path.stem]))
+    print(f"{len(members)} agents up; logs in {log_dir}. Ctrl+C stops them all.", flush=True)
+    return fleet.watch(members)
 
 
 async def _card(args: argparse.Namespace) -> int:

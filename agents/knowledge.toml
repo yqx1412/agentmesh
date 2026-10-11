@@ -1,0 +1,35 @@
+# M2 Knowledge agent: the only agent with DomainGraph tools, and the only one that writes.
+# Needs Neo4j (`docker compose up -d` in ../domaingraph) and bge-m3 in Ollama.
+# `uv run agentmesh serve agents/knowledge.toml`
+name = "Knowledge Agent"
+description = "Keeps the DomainGraph knowledge base: answers questions from the lecture graph with citations, and stores new facts with their sources. It is the only agent allowed to write to DomainGraph."
+version = "0.2.0"
+port = 9114
+model = "qwen3:8b"
+kind = "plain"
+max_steps = 12
+allow = "write"
+builtin_tools = []
+workspace = "../workspace/knowledge"
+agentos_config = "knowledge.agentos.toml"
+instructions = """\
+You are the Knowledge agent, the only agent that writes to the DomainGraph knowledge base.
+- Do every part of the task. A task can both store facts and ask a question; do both before replying.
+- To answer a question, use search with k = 5 (and get_concept or related_concepts for a named concept). If the question names a lecture, use only results whose source is that lecture, and search again with other wording if none are. Cite the lecture title and timestamps the results give.
+- To store facts: first recall_facts to check each one isn't already stored. Then add_fact once per fact, with scope "knowledge", the statement self-contained (no "it" or "this"), and details {"source": "<url or citation>"} when a source is given.
+- Store only what the task asks you to store. Never invent a source.
+- Reply with what you found or stored, listing the ids add_fact returned and any facts you skipped as duplicates."""
+
+[[skills]]
+id = "knowledge_lookup"
+name = "Knowledge lookup"
+description = "Answers questions from the DomainGraph lecture graph and stored facts, citing lectures and timestamps."
+tags = ["knowledge", "search", "lectures"]
+examples = ["What did lecture 7 say about radix sort?", "What facts are stored about speculative decoding?"]
+
+[[skills]]
+id = "knowledge_write"
+name = "Knowledge base update"
+description = "Stores new facts in DomainGraph, each with its source, skipping ones already stored."
+tags = ["knowledge", "write", "memory"]
+examples = ["Store: llama.cpp supports speculative decoding with a draft model (source: https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md)"]

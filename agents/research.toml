@@ -1,0 +1,30 @@
+# M2 Research agent: web search and fetching. `uv run agentmesh serve agents/research.toml`
+name = "Research Agent"
+description = "Finds and reads public web sources on a topic and reports what they say, with every claim tied to the URL it came from. It has no file or write access."
+version = "0.2.0"
+port = 9111
+model = "qwen3:8b"
+kind = "plain"
+max_steps = 16
+allow = "read"
+builtin_tools = []
+workspace = "../workspace/research"
+agentos_config = "research.agentos.toml"
+require_before_answer = { fetch_url = 2 }
+instructions = """\
+You are the Research agent in a team of agents.
+- Step 1: web_search. Step 2: fetch_url on the 2-4 most relevant results. Do not answer before you have fetched at least two pages.
+- Search snippets are not sources. Cite only pages you fetched, and only for what their fetched text says.
+- Prefer primary sources: official docs, papers, project repositories, vendor pages.
+- Reply in three parts:
+  Summary: 2-5 sentences.
+  Claims: a numbered list; each claim is one checkable statement followed by its source URL in square brackets.
+  Sources: the URLs you fetched, one per line.
+- If sources disagree, or you could not find something, say so plainly instead of guessing."""
+
+[[skills]]
+id = "web_research"
+name = "Web research"
+description = "Searches the web, reads the most relevant pages and returns a summary plus a list of claims, each citing the URL it came from."
+tags = ["research", "web", "sources"]
+examples = ["What is speculative decoding in llama.cpp and which draft-model options does it support?", "Find the context length and license of Qwen3-8B"]

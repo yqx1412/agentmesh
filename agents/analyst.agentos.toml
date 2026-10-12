@@ -1,0 +1,5 @@
+# Analyst agent: no MCP servers; limits for the run_python sandbox.
+[sandbox]
+allowed_commands = []
+timeout = 30
+memory_mb = 512

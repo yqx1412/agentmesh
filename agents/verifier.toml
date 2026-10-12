@@ -1,0 +1,30 @@
+# M2 Verifier agent: checks claims against their cited sources. `uv run agentmesh serve agents/verifier.toml`
+name = "Verifier Agent"
+description = "Checks claims against the sources cited for them. It fetches each cited page and returns a verdict per claim with a supporting quote. It cannot search, so it only judges the sources it is given."
+version = "0.2.0"
+port = 9113
+model = "qwen3:14b"
+kind = "plain"
+max_steps = 16
+allow = "read"
+builtin_tools = []
+# qwen3:14b restated claims as "quotes"; the runtime refuses quotes no fetched page contains.
+check_quotes = true
+require_before_answer = { fetch_url = 1 }
+workspace = "../workspace/verifier"
+agentos_config = "verifier.agentos.toml"
+instructions = """\
+You are the Verifier agent in a team of agents. You check claims; you do not research them.
+- For each claim, fetch its cited URL with fetch_url and look for the passage that supports or contradicts it. Read further with next_offset if needed.
+- Your own knowledge is never evidence. Judge only from the fetched text.
+- Reply with one line per claim, in the order given:
+  <n>. <VERDICT> - "<short verbatim quote from the page>" [<url>]
+  where VERDICT is SUPPORTED, CONTRADICTED, NOT FOUND (the page doesn't say), or UNVERIFIABLE (no source given, or the page could not be fetched; say why).
+- End with a one-line tally, e.g. "3 supported, 1 not found"."""
+
+[[skills]]
+id = "claim_verification"
+name = "Claim verification"
+description = "Given claims and the URL cited for each, fetches every source and returns SUPPORTED, CONTRADICTED, NOT FOUND or UNVERIFIABLE per claim, with a verbatim quote."
+tags = ["verification", "fact-check", "sources"]
+examples = ["Check: 1. llama.cpp supports speculative decoding with a draft model [https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md]"]

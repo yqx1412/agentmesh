@@ -1,0 +1,7 @@
+# Research agent tools: both web tools.
+[mcp_servers.web]
+command = "{python}"
+args = ["-m", "agentmesh.webtools"]
+tools = ["web_search", "fetch_url"]
+permission = "read"
+timeout = 60

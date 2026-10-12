@@ -27,7 +27,17 @@ import tomllib
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+
+BuiltinTool = Literal["read_file", "write_file", "calculator", "run_python", "run_command"]
+SANDBOX_TOOLS = ("run_python", "run_command")
 
 
 class SpecError(Exception):
@@ -61,9 +71,43 @@ class AgentSpec(BaseModel):
     # Highest AgentOS tool permission that runs. Nobody can approve a call over A2A, so
     # anything above this is refused, never asked.
     allow: Literal["read", "write", "dangerous"] = "write"
+    # AgentOS built-in tools this agent gets. run_python / run_command are the A7 sandbox
+    # (limits from the agentos_config's [sandbox] table) and need allow = "dangerous".
+    builtin_tools: list[BuiltinTool] = Field(
+        default_factory=lambda: ["read_file", "write_file", "calculator"]
+    )
+    # Appended to AgentOS's system prompt: the agent's role and output format.
+    instructions: str | None = None
+    # Tool name -> successful calls needed before a final answer is accepted, e.g.
+    # {fetch_url = 2}. Small models ignore this when it's only in the prompt, so the
+    # runtime enforces it: an early answer is sent back with a reminder (a few times at most).
+    require_before_answer: dict[str, int] = Field(default_factory=dict)
+    # Every "double-quoted" string of 20+ characters in the final answer must appear in some
+    # tool result; an answer with an invented quote is sent back (a few times at most).
+    check_quotes: bool = False
+    # qwen3's reasoning mode: slower, but needed for multi-step arithmetic.
+    think: bool = False
     workspace: Path
     agentos_config: Path | None = None
     skills: list[SkillSpec] = Field(min_length=1)
+
+    @field_validator("builtin_tools")
+    @classmethod
+    def _unique_tools(cls, tools: list[str]) -> list[str]:
+        if len(tools) != len(set(tools)):
+            raise ValueError(f"duplicate builtin tools: {tools}")
+        return tools
+
+    @model_validator(mode="after")
+    def _sandbox_needs_dangerous(self) -> AgentSpec:
+        sandboxed = [t for t in self.builtin_tools if t in SANDBOX_TOOLS]
+        if sandboxed and self.allow != "dangerous":
+            raise ValueError(f"{sandboxed} are 'dangerous' tools; set allow = \"dangerous\"")
+        if self.instructions is not None and self.kind != "plain":
+            raise ValueError('instructions are only supported for kind = "plain"')
+        if any(n < 1 for n in self.require_before_answer.values()):
+            raise ValueError("require_before_answer counts must be at least 1")
+        return self
 
     @field_validator("skills")
     @classmethod

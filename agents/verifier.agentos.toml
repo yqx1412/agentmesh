@@ -1,0 +1,7 @@
+# Verifier agent tools: fetch only. No search, so it judges the cited sources, not ones it found.
+[mcp_servers.web]
+command = "{python}"
+args = ["-m", "agentmesh.webtools"]
+tools = ["fetch_url"]
+permission = "read"
+timeout = 60

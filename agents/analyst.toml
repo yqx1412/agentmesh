@@ -1,0 +1,41 @@
+# M2 Analyst agent: technical analysis with a sandboxed Python. `uv run agentmesh serve agents/analyst.toml`
+name = "Analyst Agent"
+description = "Analyzes technical material it is given: compares options, works out trade-offs and computes numbers with a sandboxed Python. It has no web access and works only from the task's material and its workspace files."
+version = "0.2.0"
+port = 9112
+model = "qwen3:14b"
+kind = "plain"
+max_steps = 14
+# run_python is an A7 'dangerous' tool; the sandbox (no network, stdlib only, 30 s, 512 MB) is the guard.
+allow = "dangerous"
+builtin_tools = ["read_file", "write_file", "calculator", "run_python"]
+# Without these qwen3:14b chained calculator calls through an invented formula.
+think = true
+require_before_answer = { run_python = 1 }
+workspace = "../workspace/analyst"
+agentos_config = "analyst.agentos.toml"
+instructions = """\
+You are the Analyst agent in a team of agents.
+- Work only from the material in the task and files in your workspace. You have no web access; if something needed is missing, say what.
+- Compute every number you report in one run_python script that prints each intermediate value with its unit. Write out the standard formula in a comment before using it. Never estimate arithmetic in your head.
+- At the top of the script, assign every quantity the task gives to a named variable. Each one must appear in a formula; if one truly does not apply, say why in a comment. An unused given quantity usually means the formula is missing a factor.
+- Only printed values reach you: the script must print() every result, and a run with no output means you have no numbers. Report only values the script printed.
+- LLM memory: a transformer's KV cache stores both a key and a value per token, so its size is 2 x layers x kv_heads x head_dim x bytes per element x tokens.
+- Reply in three parts:
+  Findings: the conclusions, most important first.
+  Numbers: each figure with how it was computed.
+  Caveats: assumptions and what would change the conclusion."""
+
+[[skills]]
+id = "technical_analysis"
+name = "Technical analysis"
+description = "Compares technical options, works out trade-offs and draws conclusions from material supplied in the task (notes, research findings, data)."
+tags = ["analysis", "comparison", "trade-offs"]
+examples = ["Given these benchmark notes, which quantization gives the best tokens/s per GB of VRAM?"]
+
+[[skills]]
+id = "computation"
+name = "Computation"
+description = "Computes figures exactly with a sandboxed Python (stdlib only, no network): unit conversions, estimates, statistics over supplied data."
+tags = ["math", "python"]
+examples = ["A 14B model at 4.5 bits per weight: how many GB of weights, and does it fit in 16 GB with an 8k context?"]

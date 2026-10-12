@@ -40,6 +40,37 @@ Final Answer: 410.90
 - `--trace-dir` writes an AgentOS trace per task; `ask --no-stream` sends one
   blocking request instead of streaming.
 
+## M2: four specialist agents
+
+`agentmesh up` starts four specialists, each as its own A2A process, and waits
+until every Agent Card is served. Ctrl+C stops them all.
+
+| Agent | Port | Model | Tools |
+|---|---|---|---|
+| Research | 9111 | qwen3:8b | `web_search`, `fetch_url` |
+| Analyst | 9112 | qwen3:14b | `run_python` (A7 sandbox), `calculator`, workspace files |
+| Verifier | 9113 | qwen3:14b | `fetch_url` only, no search |
+| Knowledge | 9114 | qwen3:8b | DomainGraph over MCP (the only agent that writes) |
+
+```powershell
+uv run agentmesh up                                  # logs in runs/fleet/<timestamp>
+uv run agentmesh ask http://127.0.0.1:9114 "What did lecture 7 say about radix sort?"
+```
+
+- **Specs:** each agent is `agents/<name>.toml` (role prompt, port, model, card
+  skills) plus `agents/<name>.agentos.toml` (its tools and MCP servers). An agent
+  gets only the tools its spec lists.
+- **Rules enforced in code, not just the prompt:** `require_before_answer` sends
+  an answer back until the listed tools have been called (Research must fetch 2
+  pages, the Verifier 1, the Analyst must run Python once). The Verifier's quotes
+  are checked against the pages it fetched, and a quote no page contains is sent
+  back. qwen3 ignored both rules when they were only in the prompt.
+- **Web tools** (`agentmesh.webtools`, an MCP server): `fetch_url` only reaches
+  public addresses. Every redirect hop is resolved and refused if it points at
+  loopback, private or link-local space, so a page can't steer an agent at
+  Neo4j, Ollama or other local services. DNS rebinding is not covered.
+- **Knowledge** needs the DomainGraph Neo4j and Ollama running.
+
 ## Development
 
 ```powershell

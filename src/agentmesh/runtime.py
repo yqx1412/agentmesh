@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
+import os
+import re
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
-from agentos.agent import Tracer
+from agentos.agent import DEFAULT_SYSTEM_PROMPT, Agent, Tracer
 from agentos.bench.runner import make_agent
 from agentos.builtin_tools import builtin_tools
 from agentos.config import AgentOSConfig, load_config
 from agentos.llm import ChatResponse, Message, OllamaLLM
 from agentos.mcp_client import MCPManager
-from agentos.tools import Policy, ToolRegistry
+from agentos.sandbox import sandbox_tools
+from agentos.tools import Policy, Tool, ToolRegistry
 
 from agentmesh.executor import Cancelled, Progress, Runner, RunOutcome
-from agentmesh.spec import AgentSpec
+from agentmesh.spec import SANDBOX_TOOLS, AgentSpec
 
 
 class ProgressTracer(Tracer):
@@ -51,30 +54,162 @@ class CancellableLLM:
         return self.inner.chat(messages, tools)
 
 
+def _matches(tool_name: str | None, wanted: str) -> bool:
+    """MCP tools are registered as ``<server>__<tool>``; accept either form."""
+    return tool_name is not None and (tool_name == wanted or tool_name.endswith(f"__{wanted}"))
+
+
+def missing_calls(messages: list[Message], required: dict[str, int]) -> dict[str, int]:
+    """How many more successful calls of each required tool the history needs."""
+    missing = {}
+    for wanted, need in required.items():
+        done = sum(
+            1
+            for m in messages
+            if m.role == "tool"
+            and _matches(m.tool_name, wanted)
+            and not m.content.startswith("ERROR:")
+        )
+        if done < need:
+            missing[wanted] = need - done
+    return missing
+
+
+_QUOTE = re.compile(r"[\"\u201c]([^\"\u201c\u201d\n]{20,})[\"\u201d]")
+
+
+def _norm(text: str) -> str:
+    """Lower-case words only, so quotes survive whitespace, markup and punctuation changes."""
+    return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def invented_quotes(answer: str, messages: list[Message]) -> list[str]:
+    """Quoted strings in ``answer`` that appear in no successful tool result."""
+    seen = " ".join(
+        _norm(m.content)
+        for m in messages
+        if m.role == "tool" and not m.content.startswith("ERROR:")
+    )
+    return [q for q in _QUOTE.findall(answer) if _norm(q) not in seen]
+
+
+class AnswerGuardLLM:
+    """Sends an unacceptable final answer back to the model with a reminder.
+
+    A reply with no tool calls is the agent's final answer. It's refused while the history
+    lacks the spec's required tool results, or (with ``check_quotes``) while it quotes text
+    no tool returned. The model is then asked again with one extra user message (not kept in
+    the agent's history). After ``max_nudges`` the answer goes through anyway, so a tool that
+    keeps failing can't trap the task.
+    """
+
+    def __init__(
+        self,
+        inner: Any,
+        required: dict[str, int] | None = None,
+        *,
+        check_quotes: bool = False,
+        max_nudges: int = 3,
+    ) -> None:
+        self.inner = inner
+        self.model = inner.model
+        self.required = required or {}
+        self.check_quotes = check_quotes
+        self.max_nudges = max_nudges
+        self.nudges = 0
+
+    def _problem(self, answer: str, messages: list[Message]) -> str | None:
+        missing = missing_calls(messages, self.required)
+        if missing:
+            need = ", ".join(f"{n} more successful {t} call(s)" for t, n in missing.items())
+            return f"Not yet: before answering you need {need}. Call the tool now."
+        if self.check_quotes:
+            bad = invented_quotes(answer, messages)
+            if bad:
+                listed = "; ".join(f'"{q}"' for q in bad)
+                return (
+                    "These quotes are not in any page you fetched: "
+                    f"{listed}. Quote only text copied exactly from a fetched page. If no "
+                    "passage supports or contradicts a claim, its verdict is NOT FOUND. "
+                    "Fetch again or read further if you need to, then rewrite the answer."
+                )
+        return None
+
+    def chat(self, messages: list[Message], tools: list[dict[str, Any]]) -> ChatResponse:
+        resp = self.inner.chat(messages, tools)
+        extra: list[Message] = []
+        while not resp.message.tool_calls and self.nudges < self.max_nudges:
+            # Tool results fetched during earlier nudges count too.
+            problem = self._problem(resp.message.content, [*messages, *extra])
+            if problem is None:
+                break
+            self.nudges += 1
+            extra += [resp.message, Message(role="user", content=problem)]
+            resp = self.inner.chat([*messages, *extra], tools)
+        return resp
+
+
+# The M2 name, kept for the existing tests and callers.
+RequireToolsLLM = AnswerGuardLLM
+
+
+def _mcp_log(trace_dir: Path | None) -> TextIO:
+    """Where MCP servers' stderr goes: ``mcp.log`` beside the traces, or the null device."""
+    if trace_dir is None:
+        return open(os.devnull, "w", encoding="utf-8")
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    return (trace_dir / "mcp.log").open("a", encoding="utf-8")
+
+
+def select_tools(spec: AgentSpec, config: AgentOSConfig) -> list[Tool]:
+    """The built-in tools the spec names, in the spec's order (sandbox ones included)."""
+    available = {t.name: t for t in builtin_tools(spec.workspace)}
+    if any(name in SANDBOX_TOOLS for name in spec.builtin_tools):
+        available.update({t.name: t for t in sandbox_tools(spec.workspace, config.sandbox)})
+    return [available[name] for name in spec.builtin_tools]
+
+
+def system_prompt(spec: AgentSpec) -> str:
+    if not spec.instructions:
+        return DEFAULT_SYSTEM_PROMPT
+    return f"{DEFAULT_SYSTEM_PROMPT}\n\n{spec.instructions.strip()}"
+
+
 def agentos_runner(spec: AgentSpec, trace_dir: Path | None = None) -> Runner:
     config = load_config(spec.agentos_config) if spec.agentos_config else AgentOSConfig()
     spec.workspace.mkdir(parents=True, exist_ok=True)
+    prompt = system_prompt(spec)
 
     def run(task: str, progress: Progress, flag: threading.Event) -> RunOutcome:
         trace = None
         if trace_dir is not None:
             trace = trace_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{threading.get_ident()}.jsonl"
-        llm = OllamaLLM(spec.model, spec.ollama_url, num_ctx=spec.num_ctx)
+        llm = OllamaLLM(spec.model, spec.ollama_url, num_ctx=spec.num_ctx, think=spec.think)
         try:
             # Tool servers start per task, so one task's MCP state never leaks into the next.
-            with MCPManager(config.enabled_servers(spec.workspace)) as mcp:
+            with (
+                _mcp_log(trace_dir) as mcp_log,
+                MCPManager(config.enabled_servers(spec.workspace), errlog=mcp_log) as mcp,
+            ):
                 registry = ToolRegistry(
-                    [*builtin_tools(spec.workspace), *mcp.tools()],
+                    [*select_tools(spec, config), *mcp.tools()],
                     policy=Policy(auto_approve=spec.allow),
                 )
+                model: Any = CancellableLLM(llm, flag)
+                if spec.require_before_answer or spec.check_quotes:
+                    model = AnswerGuardLLM(
+                        model, spec.require_before_answer, check_quotes=spec.check_quotes
+                    )
                 agent = make_agent(
                     spec.kind,
-                    CancellableLLM(llm, flag),
+                    model,
                     registry,
                     max_steps=spec.max_steps,
                     tracer=ProgressTracer(trace, progress),
                     context_budget=int(0.75 * spec.num_ctx),
                 )
+                if isinstance(agent, Agent):
+                    agent.system_prompt = prompt
                 r = agent.run(task)
         finally:
             llm.close()

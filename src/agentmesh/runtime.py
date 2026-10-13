@@ -18,7 +18,7 @@ from agentos.mcp_client import MCPManager
 from agentos.sandbox import sandbox_tools
 from agentos.tools import Policy, Tool, ToolRegistry
 
-from agentmesh.executor import Cancelled, Progress, Runner, RunOutcome
+from agentmesh.executor import TASK_ID, Cancelled, Progress, Runner, RunOutcome
 from agentmesh.spec import SANDBOX_TOOLS, AgentSpec
 
 
@@ -183,7 +183,10 @@ def agentos_runner(spec: AgentSpec, trace_dir: Path | None = None) -> Runner:
     def run(task: str, progress: Progress, flag: threading.Event) -> RunOutcome:
         trace = None
         if trace_dir is not None:
-            trace = trace_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{threading.get_ident()}.jsonl"
+            # Named after the A2A task (see executor.TASK_ID) so `agentmesh watch` can join
+            # the trace to the task's lifecycle; the thread id is the fallback outside A2A.
+            run_id = TASK_ID.get() or str(threading.get_ident())
+            trace = trace_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{run_id}.jsonl"
         llm = OllamaLLM(spec.model, spec.ollama_url, num_ctx=spec.num_ctx, think=spec.think)
         try:
             # Tool servers start per task, so one task's MCP state never leaks into the next.

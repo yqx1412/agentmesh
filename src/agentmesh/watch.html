@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentMesh watch</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #5d6677; --line: #dde1e8;
+    --submitted: #6b7280; --working: #2563eb; --completed: #15803d; --failed: #b91c1c;
+    --other: #b45309; --code: #f1f3f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1b2029; --text: #e4e8ef; --muted: #9aa3b2; --line: #2c3340;
+      --submitted: #9ca3af; --working: #60a5fa; --completed: #4ade80; --failed: #f87171;
+      --other: #fbbf24; --code: #232a35;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap;
+           padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 17px; margin: 0; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  header label { margin-left: auto; color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, 42%); gap: 16px;
+         padding: 16px 20px; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+            padding: 12px 14px; min-width: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+       margin: 0 0 10px; }
+  .timeline { grid-column: 1 / -1; }
+  .tl-row { display: grid; grid-template-columns: 130px 1fr; align-items: center; gap: 8px;
+            height: 26px; }
+  .tl-name { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden;
+             text-overflow: ellipsis; }
+  .tl-track { position: relative; height: 16px; background: var(--code); border-radius: 4px; }
+  .tl-bar { position: absolute; top: 2px; height: 12px; min-width: 4px; border-radius: 3px;
+            border: 0; padding: 0; cursor: pointer; }
+  .tl-axis { display: grid; grid-template-columns: 130px 1fr; gap: 8px; font-size: 11px;
+             color: var(--muted); }
+  .tl-axis div:last-child { display: flex; justify-content: space-between; }
+  .lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+           gap: 12px; }
+  .lane { border: 1px solid var(--line); border-radius: 6px; padding: 8px; min-width: 0; }
+  .lane-head { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
+  .lane-head strong { font-size: 14px; }
+  .lane-sub { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; }
+  .card { display: block; width: 100%; text-align: left; margin: 0 0 6px; padding: 7px 8px;
+          border: 1px solid var(--line); border-radius: 6px; background: var(--panel);
+          color: var(--text); font: inherit; cursor: pointer; }
+  .card:hover { border-color: var(--muted); }
+  .card[aria-pressed="true"] { outline: 2px solid var(--working); outline-offset: -1px; }
+  .card .row { display: flex; justify-content: space-between; gap: 6px; font-size: 12px;
+               color: var(--muted); }
+  .card .txt { margin-top: 3px; font-size: 13px; overflow: hidden; display: -webkit-box;
+               -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .badge { display: inline-block; padding: 0 7px; border-radius: 10px; font-size: 11px;
+           font-weight: 600; color: #fff; text-transform: uppercase; letter-spacing: .03em; }
+  .s-submitted { background: var(--submitted); } .s-working { background: var(--working); }
+  .s-completed { background: var(--completed); } .s-failed { background: var(--failed); }
+  .s-rejected, .s-canceled, .s-other { background: var(--other); }
+  @media (prefers-color-scheme: dark) { .badge { color: #10131a; } }
+  .s-working.pulse { animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .55; } }
+  @media (prefers-reduced-motion: reduce) { .s-working.pulse { animation: none; } }
+  .empty { color: var(--muted); font-size: 13px; padding: 4px 2px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin: 6px 0 10px; }
+  .chips .arrow { color: var(--muted); }
+  .chips .t { color: var(--muted); font-size: 11px; margin-left: 2px; }
+  .step { border-left: 3px solid var(--line); padding: 4px 0 6px 10px; margin: 0 0 6px; }
+  .step.model { border-color: var(--working); }
+  .step.tool.ok { border-color: var(--completed); }
+  .step.tool.err { border-color: var(--failed); }
+  .step.end { border-color: var(--muted); }
+  .step .head { font-size: 12px; color: var(--muted); }
+  .step .head b { color: var(--text); }
+  pre { margin: 4px 0 0; padding: 6px 8px; background: var(--code); border-radius: 4px;
+        white-space: pre-wrap; word-break: break-word; font: 12px/1.4 ui-monospace,
+        Consolas, monospace; max-height: 320px; overflow: auto; }
+  details > summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+  .kv { font-size: 12px; color: var(--muted); }
+  .warn { color: var(--failed); font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AgentMesh watch</h1>
+  <span class="meta" id="meta">connecting...</span>
+  <label><input type="checkbox" id="follow" checked> follow the newest running task</label>
+</header>
+<main>
+  <section class="timeline" aria-label="Task timeline">
+    <h2>Last <span id="span-min">15</span> minutes</h2>
+    <div id="timeline"></div>
+  </section>
+  <section aria-label="Agents">
+    <h2>Agents</h2>
+    <div class="lanes" id="lanes"></div>
+  </section>
+  <section aria-label="Selected task" aria-live="polite">
+    <h2>Task</h2>
+    <div id="detail"><p class="empty">Pick a task to see its A2A lifecycle and every step.</p></div>
+  </section>
+</main>
+<script>
+"use strict";
+const SPAN = 15 * 60;            // seconds shown on the timeline
+const POLL_MS = 1000;
+let selected = null;             // task id
+let lastDetailKey = "";
+let data = null;
+
+// Builds DOM nodes; children that are strings become text nodes, so nothing is parsed as HTML.
+function el(tag, attrs, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k === "class") n.className = v;
+    else if (k === "style") Object.assign(n.style, v);
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v === true ? "" : String(v));
+  }
+  for (const c of kids.flat()) if (c !== null && c !== undefined && c !== false)
+    n.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  return n;
+}
+const stateClass = s => ["submitted", "working", "completed", "failed", "rejected",
+  "canceled"].includes(s) ? "s-" + s : "s-other";
+const badge = s => el("span", {class: "badge " + stateClass(s) + (s === "working" ? " pulse" : "")}, s);
+const color = s => getComputedStyle(document.documentElement)
+  .getPropertyValue("--" + (["submitted","working","completed","failed"].includes(s) ? s : "other"));
+function dur(sec) {
+  if (sec == null || sec < 0) return "";
+  if (sec < 60) return sec.toFixed(sec < 10 ? 1 : 0) + " s";
+  const m = Math.floor(sec / 60), s = Math.round(sec % 60);
+  return m < 60 ? `${m}m ${s}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+const clock = ts => ts ? new Date(ts * 1000).toLocaleTimeString() : "";
+const elapsed = t => dur((t.ended || data.now) - t.started);
+const allTasks = () => data.agents.flatMap(a => a.tasks.map(t => ({agent: a, task: t})));
+
+function select(id) {
+  selected = id;
+  document.getElementById("follow").checked = false;
+  render();
+}
+
+function renderTimeline() {
+  const box = document.getElementById("timeline");
+  const t0 = data.now - SPAN;
+  const rows = data.agents.map(a => {
+    const track = el("div", {class: "tl-track"});
+    for (const t of a.tasks) {
+      const start = Math.max(t.started || data.now, t0), end = t.ended || data.now;
+      if (end < t0) continue;
+      const left = (start - t0) / SPAN * 100, width = Math.max((end - start) / SPAN * 100, 0.4);
+      track.append(el("button", {
+        class: "tl-bar", title: `${a.name}: ${t.state}, ${elapsed(t)}\n${t.text.slice(0, 120)}`,
+        "aria-label": `${a.name} task, ${t.state}, ${elapsed(t)}`,
+        style: {left: left + "%", width: width + "%", background: color(t.state),
+                outline: t.id === selected ? "2px solid var(--text)" : ""},
+        onclick: () => select(t.id),
+      }));
+    }
+    return el("div", {class: "tl-row"}, el("div", {class: "tl-name", title: a.name}, a.name), track);
+  });
+  const axis = el("div", {class: "tl-axis"}, el("div"),
+    el("div", {}, ...[15, 10, 5, 0].map(m => el("span", {}, m ? `-${m} min` : "now"))));
+  box.replaceChildren(...rows, axis);
+}
+
+function renderLanes() {
+  const lanes = data.agents.map(a => {
+    const up = a.up === true ? "var(--completed)" : a.up === false ? "var(--failed)" : "var(--submitted)";
+    const upText = a.up === true ? "up" : a.up === false ? "down" : "unknown";
+    const cards = a.tasks.length ? a.tasks.map(t => el("button", {
+        class: "card", "aria-pressed": t.id === selected ? "true" : "false",
+        onclick: () => select(t.id),
+      },
+      el("div", {class: "row"}, badge(t.state),
+         el("span", {}, `${t.tool_calls} tool${t.tool_calls === 1 ? "" : "s"} · ${elapsed(t)}`)),
+      el("div", {class: "txt"}, t.text || "(no task text)"),
+      el("div", {class: "row"}, el("span", {}, clock(t.started)),
+         t.journal ? null : el("span", {title: "This run has a trace but no A2A journal"}, "trace only")),
+    )) : [el("p", {class: "empty"}, "No tasks yet.")];
+    return el("div", {class: "lane"},
+      el("div", {class: "lane-head"},
+        el("span", {class: "dot", style: {background: up}, title: "agent " + upText}),
+        el("strong", {}, a.name),
+        el("span", {class: "kv", style: {marginLeft: "auto"}}, a.busy ? "busy" : "idle")),
+      el("div", {class: "lane-sub"}, [a.model, a.url, upText].filter(Boolean).join(" · ")),
+      ...cards);
+  });
+  document.getElementById("lanes").replaceChildren(...lanes);
+}
+
+function renderDetail() {
+  const box = document.getElementById("detail");
+  const hit = allTasks().find(x => x.task.id === selected);
+  if (!hit) {
+    lastDetailKey = "";
+    box.replaceChildren(el("p", {class: "empty"},
+      "Pick a task to see its A2A lifecycle and every step."));
+    return;
+  }
+  const {agent, task: t} = hit;
+  const key = JSON.stringify(t) + (t.ended ? "" : Math.floor(data.now));
+  if (key === lastDetailKey) return;   // unchanged: keep open <details> as they are
+  lastDetailKey = key;
+  const open = new Set([...box.querySelectorAll("details[open]")].map(d => d.dataset.k));
+
+  const chips = el("div", {class: "chips"});
+  t.events.filter((e, i, xs) => e.state !== "working" || i === 0 || xs[i - 1].state !== "working")
+    .forEach((e, i) => {
+      if (i) chips.append(el("span", {class: "arrow"}, "→"));
+      chips.append(badge(e.state), el("span", {class: "t"}, clock(e.ts)));
+    });
+
+  const steps = (t.steps || []).map((s, i) => {
+    const k = `${t.id}:${i}`;
+    const det = (label, text) => el("details", {"data-k": k + label, open: open.has(k + label)},
+      el("summary", {}, label), el("pre", {}, text));
+    if (s.kind === "start") return el("div", {class: "step"},
+      el("div", {class: "head"}, el("b", {}, "start"), ` ${clock(s.ts)} · ${s.model} · tools: `,
+        (s.tools || []).join(", ") || "none"));
+    if (s.kind === "model") {
+      const calls = s.tool_calls.map(c => det(`call ${c.name}`, c.arguments));
+      return el("div", {class: "step model"},
+        el("div", {class: "head"}, el("b", {}, `step ${s.step}: model`), ` ${clock(s.ts)}`,
+          s.prompt_tokens ? ` · ${s.prompt_tokens} in / ${s.completion_tokens} out tokens` : ""),
+        s.content ? el("pre", {}, s.content) : null,
+        s.tool_calls.length ? null : el("div", {class: "kv"}, "no tool calls: final answer"),
+        ...calls);
+    }
+    if (s.kind === "tool") {
+      const emptyOk = s.ok && /^exit code 0\s*$/.test(s.output.trim());
+      return el("div", {class: "step tool " + (s.ok ? "ok" : "err")},
+        el("div", {class: "head"}, el("b", {}, `${s.name}`), ` ${s.ok ? "ok" : "error"} · ${clock(s.ts)}`,
+          emptyOk ? el("span", {class: "warn"}, " · printed nothing") : null),
+        det("output", s.output || "(empty)"));
+    }
+    if (s.kind === "end") return el("div", {class: "step end"},
+      el("div", {class: "head"}, el("b", {}, "end"), ` ${clock(s.ts)} · ${s.stop_reason}`));
+    return null;
+  });
+
+  const stats = t.stats ? Object.entries(t.stats).map(([k, v]) => `${k} ${v}`).join(" · ") : "";
+  const failMsg = [...t.events].reverse().find(e => e.state === "failed" || e.state === "rejected");
+  box.replaceChildren(
+    el("div", {class: "kv"}, `${agent.name} · task ${t.id}`),
+    el("div", {class: "kv"}, `started ${clock(t.started)} · ${elapsed(t)}`, t.trace ? ` · ${t.trace}` : ""),
+    chips,
+    el("div", {class: "kv"}, "Task"), el("pre", {}, t.text || "(none)"),
+    el("h2", {style: {marginTop: "14px"}}, "Steps"),
+    steps.length ? steps : el("p", {class: "empty"},
+      t.journal ? "No AgentOS trace for this task." : "No steps recorded."),
+    t.answer ? [el("h2", {style: {marginTop: "14px"}}, "Answer"), el("pre", {}, t.answer)] : null,
+    failMsg && failMsg.message ? [el("h2", {style: {marginTop: "14px"}}, "Failure"),
+      el("pre", {}, failMsg.message)] : null,
+    stats ? el("div", {class: "kv", style: {marginTop: "8px"}}, stats) : null,
+  );
+}
+
+function render() {
+  if (!data) return;
+  if (document.getElementById("follow").checked) {
+    const running = allTasks().filter(x => x.task.state === "working" || x.task.state === "submitted")
+      .sort((a, b) => b.task.started - a.task.started);
+    if (running.length) selected = running[0].task.id;
+  }
+  const n = data.agents.reduce((k, a) => k + a.tasks.length, 0);
+  const busy = data.agents.filter(a => a.busy).length;
+  document.getElementById("meta").textContent =
+    `${data.agents.length} agents · ${busy} busy · ${n} tasks · ${data.root} · updated ${clock(data.now)}`;
+  renderTimeline(); renderLanes(); renderDetail();
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/api/state", {cache: "no-store"});
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    data = await r.json();
+    render();
+  } catch (e) {
+    document.getElementById("meta").textContent = "lost connection to agentmesh watch: " + e.message;
+  } finally {
+    setTimeout(poll, POLL_MS);
+  }
+}
+document.getElementById("follow").addEventListener("change", render);
+poll();
+</script>
+</body>
+</html>

@@ -1,4 +1,4 @@
-"""``agentmesh serve <spec> | card <url> | ask <url> <task>``."""
+"""``agentmesh serve <spec> | up | watch | card <url> | ask <url> <task>``."""
 
 from __future__ import annotations
 
@@ -31,6 +31,16 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--trace-dir", type=Path, help="Per-agent AgentOS traces under this folder")
     up.add_argument("--ready-timeout", type=float, default=60.0, help="Seconds (default: 60)")
 
+    watch = sub.add_parser("watch", help="Live page of every agent's A2A tasks and steps")
+    watch.add_argument(
+        "--trace-root",
+        type=Path,
+        default=Path("runs") / "fleet-traces",
+        help="The folder given to `up --trace-dir` (default: runs/fleet-traces)",
+    )
+    watch.add_argument("--agents-dir", type=Path, default=Path("agents"), help="Default: agents")
+    watch.add_argument("--port", type=int, default=9130, help="Default: 9130 (127.0.0.1 only)")
+
     card = sub.add_parser("card", help="Fetch and print an agent's card")
     card.add_argument("url")
 
@@ -48,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args)
     if args.command == "up":
         return _up(args)
+    if args.command == "watch":
+        return _watch(args)
     if args.command == "card":
         return asyncio.run(_card(args))
     if args.command == "ask":
@@ -70,7 +82,12 @@ def _serve(args: argparse.Namespace) -> int:
         return 2
     if args.port:
         spec = spec.model_copy(update={"port": args.port})
-    app = build_app(spec, agentos_runner(spec, args.trace_dir))
+    journal = None
+    if args.trace_dir is not None:
+        from agentmesh.journal import JOURNAL_NAME, JsonlJournal
+
+        journal = JsonlJournal(args.trace_dir / JOURNAL_NAME, spec.name)
+    app = build_app(spec, agentos_runner(spec, args.trace_dir), journal)
     print(f"{spec.name} on {spec.url} (model {spec.model}, workspace {spec.workspace})")
     uvicorn.run(app, host=spec.host, port=spec.port, log_level="warning")
     return 0
@@ -100,6 +117,40 @@ def _up(args: argparse.Namespace) -> int:
         print(fleet.describe(m, cards[m.path.stem]))
     print(f"{len(members)} agents up; logs in {log_dir}. Ctrl+C stops them all.", flush=True)
     return fleet.watch(members)
+
+
+def _watch(args: argparse.Namespace) -> int:
+    import threading
+
+    from agentmesh import fleet, watch
+    from agentmesh.spec import SpecError, load_spec
+
+    agents = []
+    for path in fleet.default_specs(args.agents_dir):
+        if not path.exists():
+            continue
+        try:
+            spec = load_spec(path)
+        except SpecError as exc:
+            print(f"skipping {path}: {exc}", file=sys.stderr)
+            continue
+        agents.append(watch.AgentInfo(path.stem, spec.name, spec.url, spec.model))
+    watcher = watch.Watcher(args.trace_root, agents)
+    try:
+        server = watch.serve(watcher, args.port)
+    except OSError as exc:
+        print(f"cannot listen on 127.0.0.1:{args.port}: {exc}", file=sys.stderr)
+        return 1
+    threading.Thread(target=watcher.run_probes, daemon=True).start()
+    print(f"watching {args.trace_root} on http://127.0.0.1:{args.port}/ (Ctrl+C stops)", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        watcher.stop()
+        server.server_close()
+    return 0
 
 
 async def _card(args: argparse.Namespace) -> int:

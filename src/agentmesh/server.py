@@ -8,7 +8,7 @@ from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
 from starlette.applications import Starlette
 
-from agentmesh.executor import AgentOSExecutor, Runner
+from agentmesh.executor import AgentOSExecutor, Journal, Runner
 from agentmesh.spec import AgentSpec
 
 
@@ -38,10 +38,10 @@ def build_card(spec: AgentSpec) -> AgentCard:
     )
 
 
-def build_app(spec: AgentSpec, runner: Runner) -> Starlette:
+def build_app(spec: AgentSpec, runner: Runner, journal: Journal | None = None) -> Starlette:
     card = build_card(spec)
     handler = DefaultRequestHandler(
-        agent_executor=AgentOSExecutor(runner),
+        agent_executor=AgentOSExecutor(runner, journal),
         task_store=InMemoryTaskStore(),
         agent_card=card,
     )

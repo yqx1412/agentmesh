@@ -71,6 +71,27 @@ uv run agentmesh ask http://127.0.0.1:9114 "What did lecture 7 say about radix s
   Neo4j, Ollama or other local services. DNS rebinding is not covered.
 - **Knowledge** needs the DomainGraph Neo4j and Ollama running.
 
+## Watching the fleet live
+
+`agentmesh watch` serves a page on `http://127.0.0.1:9130/` that follows every
+agent's tasks as they run.
+
+```powershell
+uv run agentmesh up --trace-dir runs/fleet-traces    # one trace folder per agent
+uv run agentmesh watch                               # then open http://127.0.0.1:9130/
+```
+
+- **One lane per agent**, showing whether it's up and busy. Each task is a card
+  that moves through submitted, working, then completed or failed, with its
+  elapsed time, tokens, tool calls, tool output and final answer.
+- **A2A journal:** `serve --trace-dir` now writes `a2a.jsonl` beside the traces,
+  one line per task state change, with the A2A task and context IDs. Traces from
+  before the journal still show, with their state worked out from the trace.
+- **Any client:** it reads the trace folders rather than acting as an A2A
+  client, so it shows tasks from `ask`, another agent or a raw JSON-RPC call.
+- **No login:** it binds to `127.0.0.1` only. The page shows tool output and
+  fetched web pages, so don't expose it.
+
 ## Development
 
 ```powershell

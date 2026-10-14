@@ -92,6 +92,33 @@ uv run agentmesh watch                               # then open http://127.0.0.
 - **No login:** it binds to `127.0.0.1` only. The page shows tool output and
   fetched web pages, so don't expose it.
 
+## M3: the orchestrator
+
+`agentmesh orchestrate` splits one task across the fleet. It finds the agents
+from their Agent Cards, plans which skills to use, runs the steps over A2A and
+combines the results into one answer.
+
+```powershell
+uv run agentmesh up --trace-dir runs/fleet-traces
+uv run agentmesh orchestrate "Research local LLM inference and update my knowledge base"
+uv run agentmesh orchestrate "..." --plan-only       # print the plan, send nothing
+```
+
+- **Discovery:** the orchestrator reads each agent's card (by default the URLs in
+  `agents/*.toml`, or `--agent URL`, repeated). The skills on the cards are the
+  only skills a plan may use.
+- **Planning:** qwen3:14b writes a JSON plan of at most 6 steps, constrained to
+  a schema whose skill IDs come from the cards. A plan naming an unknown skill,
+  an unknown step or a cycle is rejected.
+- **Running:** a step can use earlier answers with `{{s1}}`, and steps whose
+  inputs are ready run in parallel. A failed step skips every step that needs
+  it, and the rest still run. Each step has a timeout (`--step-timeout`,
+  default 900 s).
+- **Tracing:** every delegated task carries its orchestration ID and step in the
+  A2A message metadata, and each agent's journal records them. The orchestrator
+  writes its own trace to `runs/fleet-traces/orchestrator/`, so `watch` shows
+  it as the first lane and links it to its child tasks.
+
 ## Development
 
 ```powershell

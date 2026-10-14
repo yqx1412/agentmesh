@@ -33,6 +33,8 @@ PAGE = Path(__file__).with_name("watch.html")
 CARD_PATH = "/.well-known/agent-card.json"
 TERMINAL = {"completed", "failed", "rejected", "canceled"}
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+# The folder `agentmesh orchestrate --trace-root` writes under the same root.
+ORCHESTRATOR = "orchestrator"
 
 # How much of a tool output, model reply or answer to send to the page.
 MAX_TEXT = 4000
@@ -178,6 +180,9 @@ def collect_agent(folder: Path, reader: TraceReader) -> list[dict[str, Any]]:
         )
         if state == "submitted":
             t["text"] = _clip(rec.get("text") or "")
+            for key in ("orchestration", "step"):
+                if rec.get(key):
+                    t[key] = str(rec[key])
         if state == "completed":
             t["answer"] = _clip(rec.get("answer") or "")
         if rec.get("stats"):
@@ -258,6 +263,8 @@ class Watcher:
             if self.root.is_dir():
                 for d in sorted(p for p in self.root.iterdir() if p.is_dir()):
                     known.setdefault(d.name, AgentInfo(key=d.name, name=d.name))
+            if ORCHESTRATOR in known:  # the lane that starts the others goes first
+                known = {ORCHESTRATOR: known.pop(ORCHESTRATOR), **known}
             out = []
             for key, info in known.items():
                 tasks = collect_agent(self.root / key, self.reader)

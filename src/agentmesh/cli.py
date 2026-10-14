@@ -49,6 +49,32 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("task")
     ask.add_argument("--no-stream", action="store_true", help="One blocking request")
     ask.add_argument("--timeout", type=float, default=900.0, help="Seconds (default: 900)")
+
+    orch = sub.add_parser(
+        "orchestrate", help="Split a task across the agents found by their Agent Cards"
+    )
+    orch.add_argument("task")
+    orch.add_argument(
+        "--agent",
+        dest="agents",
+        action="append",
+        metavar="URL",
+        help="An agent's base URL; repeat it. Default: the URLs in the fleet's specs",
+    )
+    orch.add_argument("--agents-dir", type=Path, default=Path("agents"), help="Default: agents")
+    orch.add_argument("--model", default="qwen3:14b", help="Planner model (default: qwen3:14b)")
+    orch.add_argument("--ollama-url", default="http://127.0.0.1:11434")
+    orch.add_argument(
+        "--trace-root",
+        type=Path,
+        default=Path("runs") / "fleet-traces",
+        help="Writes <root>/orchestrator/, beside the agents' traces (default: runs/fleet-traces)",
+    )
+    orch.add_argument("--out", type=Path, help="Also write the whole run as one JSON file")
+    orch.add_argument("--plan-only", action="store_true", help="Print the plan; send nothing")
+    orch.add_argument(
+        "--step-timeout", type=float, default=900.0, help="Seconds per step (default: 900)"
+    )
     return p
 
 
@@ -64,6 +90,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_card(args))
     if args.command == "ask":
         return asyncio.run(_ask(args))
+    if args.command == "orchestrate":
+        return asyncio.run(_orchestrate(args))
     build_parser().print_help()
     return 0
 
@@ -188,3 +216,53 @@ async def _ask(args: argparse.Namespace) -> int:
     if run.stats:
         print(f"[{run.state}] {json.dumps(run.stats)}", file=sys.stderr)
     return 0 if run.state == "completed" else 3
+
+
+def _fleet_urls(agents_dir: Path) -> list[str]:
+    """Where to look for agents: the URL in each fleet spec. Which agent does what comes
+    from its card, not from here."""
+    from agentmesh import fleet
+    from agentmesh.spec import SpecError, load_spec
+
+    urls = []
+    for path in fleet.default_specs(agents_dir):
+        try:
+            urls.append(load_spec(path).url)
+        except SpecError as exc:
+            print(f"skipping {path}: {exc}", file=sys.stderr)
+    return urls
+
+
+async def _orchestrate(args: argparse.Namespace) -> int:
+    from agentmesh.orchestrator import OllamaChat, discover_all, orchestrate
+
+    urls = args.agents or _fleet_urls(args.agents_dir)
+    async with httpx.AsyncClient(timeout=args.step_timeout) as http:
+        cards, errors = await discover_all(urls, http)
+        for e in errors:
+            print(f"no card: {e}", file=sys.stderr)
+        for c in cards:
+            print(f"found {c.name}: {', '.join(s.id for s in c.skills)}", file=sys.stderr)
+        out = await orchestrate(
+            args.task,
+            cards,
+            OllamaChat(args.model, args.ollama_url),
+            http,
+            trace_root=args.trace_root,
+            step_timeout=args.step_timeout,
+            plan_only=args.plan_only,
+            on_line=lambda line: print(f"  {line}", file=sys.stderr, flush=True),
+            model_name=args.model,
+        )
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(
+            json.dumps(out.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    if out.answer:
+        print(out.answer)
+    if out.message:
+        print(f"[{out.state}] {out.message}", file=sys.stderr)
+    if out.trace:
+        print(f"trace: {out.trace}", file=sys.stderr)
+    return 0 if out.state == "completed" else 3

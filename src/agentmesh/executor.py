@@ -84,6 +84,19 @@ def _agent_text(updater: TaskUpdater, text: str):
     return updater.new_agent_message([Part(text=text)])
 
 
+def _origin(context: RequestContext) -> dict[str, str]:
+    """The orchestration run and step that sent this task, from the message metadata."""
+    msg = context.message
+    if msg is None or not msg.HasField("metadata"):
+        return {}
+    meta = msg.metadata
+    out = {}
+    for key in ("orchestration", "step"):
+        if key in meta.fields and meta.fields[key].WhichOneof("kind") == "string_value":
+            out[key] = meta.fields[key].string_value[:100]
+    return out
+
+
 class AgentOSExecutor(AgentExecutor):
     def __init__(self, runner: Runner, journal: Journal | None = None) -> None:
         self.runner = runner
@@ -109,7 +122,7 @@ class AgentOSExecutor(AgentExecutor):
             self._log(task.id, task.context_id, state, **data)
 
         text = get_message_text(context.message).strip() if context.message else ""
-        note("submitted", text=text[:_PREVIEW])
+        note("submitted", text=text[:_PREVIEW], **_origin(context))
         if not text:
             msg = "The request has no text to act on."
             await updater.reject(_agent_text(updater, msg))

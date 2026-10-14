@@ -186,6 +186,8 @@ function renderLanes() {
          el("span", {}, `${t.tool_calls} tool${t.tool_calls === 1 ? "" : "s"} · ${elapsed(t)}`)),
       el("div", {class: "txt"}, t.text || "(no task text)"),
       el("div", {class: "row"}, el("span", {}, clock(t.started)),
+         t.orchestration ? el("span", {class: "kv", title: "Started by an orchestration"},
+           `${t.step || "step"} of an orchestration`) : null,
          t.journal ? null : el("span", {title: "This run has a trace but no A2A journal"}, "trace only")),
     )) : [el("p", {class: "empty"}, "No tasks yet.")];
     return el("div", {class: "lane"},
@@ -251,10 +253,24 @@ function renderDetail() {
 
   const stats = t.stats ? Object.entries(t.stats).map(([k, v]) => `${k} ${v}`).join(" · ") : "";
   const failMsg = [...t.events].reverse().find(e => e.state === "failed" || e.state === "rejected");
-  box.replaceChildren(
+  // The chain: this task's orchestration, or the tasks this orchestration started.
+  const parent = t.orchestration ? allTasks().find(x => x.task.id === t.orchestration) : null;
+  const children = allTasks().filter(x => x.task.orchestration === t.id)
+    .sort((a, b) => (a.task.started || 0) - (b.task.started || 0));
+  const link = (x, label) => el("button", {class: "card", onclick: () => select(x.task.id)},
+    el("div", {class: "row"}, badge(x.task.state), el("span", {}, label)));
+  const chain = parent ? [el("div", {class: "kv"}, `${t.step || "A step"} of`),
+      link(parent, `${parent.agent.name} · ${parent.task.text.slice(0, 80)}`)]
+    : t.orchestration ? [el("div", {class: "kv"}, `${t.step || "A step"} of orchestration ${t.orchestration}`)]
+    : children.length ? [el("h2", {style: {marginTop: "14px"}}, "Delegated tasks"),
+      ...children.map(x => link(x, `${x.task.step || "?"} → ${x.agent.name} · ${elapsed(x.task)}`))]
+    : null;
+  // replaceChildren neither flattens arrays nor skips null, so do both here.
+  box.replaceChildren(...[
     el("div", {class: "kv"}, `${agent.name} · task ${t.id}`),
     el("div", {class: "kv"}, `started ${clock(t.started)} · ${elapsed(t)}`, t.trace ? ` · ${t.trace}` : ""),
     chips,
+    chain,
     el("div", {class: "kv"}, "Task"), el("pre", {}, t.text || "(none)"),
     el("h2", {style: {marginTop: "14px"}}, "Steps"),
     steps.length ? steps : el("p", {class: "empty"},
@@ -263,7 +279,7 @@ function renderDetail() {
     failMsg && failMsg.message ? [el("h2", {style: {marginTop: "14px"}}, "Failure"),
       el("pre", {}, failMsg.message)] : null,
     stats ? el("div", {class: "kv", style: {marginTop: "8px"}}, stats) : null,
-  );
+  ].flat(2).filter(x => x instanceof Node));
 }
 
 function render() {

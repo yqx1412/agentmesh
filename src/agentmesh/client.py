@@ -57,40 +57,45 @@ async def ask(
     *,
     streaming: bool = True,
     on_event: Callable[[StreamResponse], None] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> TaskRun:
+    """Send ``text`` and follow the task to the end. ``metadata`` rides on the message
+    (the orchestrator uses it to tag the tasks it starts)."""
     client = await create_client(
         agent=card, client_config=ClientConfig(streaming=streaming, httpx_client=http)
     )
     run = TaskRun()
-    request = SendMessageRequest(message=new_text_message(text, role=Role.ROLE_USER))
-    try:
-        async for event in client.send_message(request):
-            if on_event:
-                on_event(event)
-            kind = event.WhichOneof("payload")
-            if kind == "task":
-                t = event.task
-                run.task_id = t.id
-                _note_state(run, t.status.state)
-                for a in t.artifacts:
-                    _take_artifact(run, a)
-                if t.status.HasField("message"):
-                    run.final_message = get_message_text(t.status.message)
-            elif kind == "status_update":
-                s = event.status_update.status
-                _note_state(run, s.state)
-                if s.HasField("message"):
-                    line = get_message_text(s.message)
-                    if s.state == TaskState.TASK_STATE_WORKING:
-                        run.progress.append(line)
-                    else:
-                        run.final_message = line
-            elif kind == "artifact_update":
-                _take_artifact(run, event.artifact_update.artifact)
-            elif kind == "message":
-                run.answer = get_message_text(event.message)
-    finally:
-        await client.close()
+    message = new_text_message(text, role=Role.ROLE_USER)
+    if metadata:
+        message.metadata.update(metadata)
+    request = SendMessageRequest(message=message)
+    # No client.close(): the SDK's JSON-RPC transport closes only the httpx client, which
+    # belongs to the caller (the orchestrator sends many tasks through one).
+    async for event in client.send_message(request):
+        if on_event:
+            on_event(event)
+        kind = event.WhichOneof("payload")
+        if kind == "task":
+            t = event.task
+            run.task_id = t.id
+            _note_state(run, t.status.state)
+            for a in t.artifacts:
+                _take_artifact(run, a)
+            if t.status.HasField("message"):
+                run.final_message = get_message_text(t.status.message)
+        elif kind == "status_update":
+            s = event.status_update.status
+            _note_state(run, s.state)
+            if s.HasField("message"):
+                line = get_message_text(s.message)
+                if s.state == TaskState.TASK_STATE_WORKING:
+                    run.progress.append(line)
+                else:
+                    run.final_message = line
+        elif kind == "artifact_update":
+            _take_artifact(run, event.artifact_update.artifact)
+        elif kind == "message":
+            run.answer = get_message_text(event.message)
     return run
 
 

@@ -22,6 +22,7 @@ from agentmesh.orchestrator import (
     orchestrate,
     parse_plan,
     plan_schema,
+    step_input,
 )
 from agentmesh.server import build_app
 from agentmesh.spec import AgentSpec, SkillSpec
@@ -319,3 +320,19 @@ def test_fill_replaces_every_reference():
 
     r = StepResult(Step("s1", "a", "x"), answer="  ANSWER \n")
     assert fill("a {{s1}} b {{ s1 }}", {"s1": r}) == "a ANSWER b ANSWER"
+
+
+def test_step_input_appends_dependencies_the_input_never_references():
+    from agentmesh.orchestrator import Step, StepResult
+
+    s1 = StepResult(Step("s1", "a", "go"), state="completed", answer=" claim A [1] ")
+    s2 = StepResult(Step("s2", "a", "go"), state="completed", answer="claim B")
+    both = {"s1": s1, "s2": s2}
+
+    # Listed in depends_on but not written into the input: appended, labelled.
+    out = step_input(Step("s3", "b", "Verify the claims.", ["s1"]), both)
+    assert out == "Verify the claims.\n\nResult of step s1:\nclaim A [1]"
+
+    # Referenced inline: substituted once, not appended again.
+    out = step_input(Step("s3", "b", "Check {{s1}}; also see", ["s1", "s2"]), both)
+    assert out == "Check claim A [1]; also see\n\nResult of step s2:\nclaim B"

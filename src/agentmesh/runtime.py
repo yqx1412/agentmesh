@@ -96,9 +96,10 @@ def invented_quotes(answer: str, messages: list[Message]) -> list[str]:
 class AnswerGuardLLM:
     """Sends an unacceptable final answer back to the model with a reminder.
 
-    A reply with no tool calls is the agent's final answer. It's refused while the history
-    lacks the spec's required tool results, or (with ``check_quotes``) while it quotes text
-    no tool returned. The model is then asked again with one extra user message (not kept in
+    A reply with no tool calls is the agent's final answer. It's refused when it's empty,
+    while the history lacks the spec's required tool results, or (with ``check_quotes``) while
+    it quotes text no tool returned. The model is then asked again with one extra user
+    message (not kept in
     the agent's history). After ``max_nudges`` the answer goes through anyway, so a tool that
     keeps failing can't trap the task.
     """
@@ -119,6 +120,11 @@ class AnswerGuardLLM:
         self.nudges = 0
 
     def _problem(self, answer: str, messages: list[Message]) -> str | None:
+        if not answer.strip():
+            return (
+                "Your reply was empty. Do the task now: call the tools it needs, then reply "
+                "with the result."
+            )
         missing = missing_calls(messages, self.required)
         if missing:
             need = ", ".join(f"{n} more successful {t} call(s)" for t, n in missing.items())
@@ -199,10 +205,11 @@ def agentos_runner(spec: AgentSpec, trace_dir: Path | None = None) -> Runner:
                     policy=Policy(auto_approve=spec.allow),
                 )
                 model: Any = CancellableLLM(llm, flag)
-                if spec.require_before_answer or spec.check_quotes:
-                    model = AnswerGuardLLM(
-                        model, spec.require_before_answer, check_quotes=spec.check_quotes
-                    )
+                # Always guarded: an empty final answer is refused for every agent, and the
+                # spec's required tools and quote check are added where it asks for them.
+                model = AnswerGuardLLM(
+                    model, spec.require_before_answer, check_quotes=spec.check_quotes
+                )
                 agent = make_agent(
                     spec.kind,
                     model,

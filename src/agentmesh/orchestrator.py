@@ -414,6 +414,21 @@ def fill(text: str, results: dict[str, StepResult]) -> str:
     return _REF.sub(lambda m: results[m.group(1)].answer.strip(), text)
 
 
+def step_input(step: Step, results: dict[str, StepResult]) -> str:
+    """The message a step's agent receives.
+
+    The planner often lists a dependency in ``depends_on`` but never writes ``{{sN}}`` into
+    the input ("Verify the claims from the research"), which would send the agent a request
+    about data it never sees. Any dependency the input doesn't reference is appended.
+    """
+    text = fill(step.input, results)
+    used = set(_REF.findall(step.input))
+    for dep in step.depends_on:
+        if dep not in used:
+            text += f"\n\nResult of step {dep}:\n{results[dep].answer.strip()}"
+    return text
+
+
 async def _run_one(
     step: Step,
     results: dict[str, StepResult],
@@ -426,7 +441,7 @@ async def _run_one(
     r = results[step.id]
     skill = catalogue[step.skill][0]
     r.agent, r.url = skill.agent, agent_url(skill.card)
-    r.input = fill(step.input, results)
+    r.input = step_input(step, results)
     r.state, r.started = "working", time.time()
     rec.state("working", message=f"{step.id}: sending {step.skill} to {r.agent}")
 

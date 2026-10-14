@@ -253,3 +253,11 @@ def test_plan_rejects_duplicate_ports(tmp_path):
         )
     with pytest.raises(SpecError, match="both use port"):
         fleet.plan([tmp_path / "a.toml", tmp_path / "b.toml"], tmp_path / "logs")
+
+
+def test_guard_sends_empty_answer_back_even_with_no_rules():
+    # qwen3:8b once ended a Knowledge task with an empty reply and no tool call (M3 demo).
+    inner = ScriptedLLM([Message(role="assistant", content="  "), ANSWER])
+    resp = AnswerGuardLLM(inner).chat([Message(role="user", content="q")], [])
+    assert resp.message is ANSWER
+    assert "reply was empty" in inner.seen[1][-1].content

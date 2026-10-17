@@ -582,7 +582,9 @@ async def _run_one(
         if n + 1 < len(candidates):
             rec.state(
                 "working",
-                message=f"{step.id}: falling back from {skill.agent} to {candidates[n + 1].agent}",
+                # Name + URL: two agents can share a card name (two Research agents).
+                message=f"{step.id}: falling back from {skill.agent} ({agent_url(skill.card)}) "
+                f"to {candidates[n + 1].agent} ({agent_url(candidates[n + 1].card)})",
             )
     if not r.ok:
         r.state = "failed"

@@ -43,7 +43,9 @@ Final Answer: 410.90
 ## M2: four specialist agents
 
 `agentmesh up` starts four specialists, each as its own A2A process, and waits
-until every Agent Card is served. Ctrl+C stops them all.
+until every Agent Card is served. Ctrl+C stops them all. An agent that exits is
+restarted on its own (2 s backoff, doubling, up to `--max-restarts`, default 3)
+while the others keep running, so one dead agent never takes the fleet down.
 
 | Agent | Port | Model | Tools |
 |---|---|---|---|

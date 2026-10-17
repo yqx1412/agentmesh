@@ -30,6 +30,18 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--log-dir", type=Path, help="Default: runs/fleet/<timestamp>")
     up.add_argument("--trace-dir", type=Path, help="Per-agent AgentOS traces under this folder")
     up.add_argument("--ready-timeout", type=float, default=60.0, help="Seconds (default: 60)")
+    up.add_argument(
+        "--max-restarts",
+        type=int,
+        default=3,
+        help="Restarts per agent that exits; 0 = leave it down (default: 3)",
+    )
+    up.add_argument(
+        "--restart-backoff",
+        type=float,
+        default=2.0,
+        help="Seconds before the first restart, doubling each time (default: 2)",
+    )
 
     watch = sub.add_parser("watch", help="Live page of every agent's A2A tasks and steps")
     watch.add_argument(
@@ -160,7 +172,7 @@ def _up(args: argparse.Namespace) -> int:
     for m in members:
         print(fleet.describe(m, cards[m.path.stem]))
     print(f"{len(members)} agents up; logs in {log_dir}. Ctrl+C stops them all.", flush=True)
-    return fleet.watch(members)
+    return fleet.watch(members, args.max_restarts, args.restart_backoff)
 
 
 def _watch(args: argparse.Namespace) -> int:

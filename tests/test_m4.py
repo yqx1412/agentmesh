@@ -483,3 +483,61 @@ def test_webhooks_must_be_loopback(url, ok):
 
 def test_card_advertises_push(tmp_path):
     assert build_card(make_spec("X", 9381, "w", tmp_path)).capabilities.push_notifications
+
+
+# --- agentmesh up: one dead agent must not take the fleet down ---------------------------
+
+
+def fleet_member(tmp: Path, name: str, code: str):
+    from agentmesh.fleet import Member
+
+    m = Member(tmp / f"{name}.toml", make_spec(name, 9390, "w", tmp), tmp / "logs" / f"{name}.log")
+    m.cmd = [sys.executable, "-c", code]
+    return m
+
+
+def test_up_restarts_a_dead_agent_and_keeps_the_others(tmp_path):
+    import threading
+
+    from agentmesh import fleet
+
+    crasher = fleet_member(tmp_path, "Crasher", "import sys; print('up'); sys.exit(3)")
+    steady = fleet_member(tmp_path, "Steady", "import time; time.sleep(60)")
+    members = [crasher, steady]
+    fleet.start(members)
+    first_pid = steady.proc.pid
+    stop = threading.Event()
+    result: list[int] = []
+    t = threading.Thread(
+        target=lambda: result.append(
+            fleet.watch(members, max_restarts=2, backoff=0.05, poll=0.05, stop_event=stop)
+        )
+    )
+    t.start()
+    try:
+        end = time.monotonic() + 15
+        while not crasher.down:
+            assert time.monotonic() < end, "crasher never ran out of restarts"
+            time.sleep(0.05)
+        assert crasher.restarts == 2
+        # The other agent is the same process, still running.
+        assert steady.proc.pid == first_pid and steady.proc.poll() is None
+        assert t.is_alive()
+    finally:
+        stop.set()
+        t.join(15)
+    assert result == [0]
+    assert steady.proc.poll() is not None  # stopping the launcher stops everyone
+    log = crasher.log.read_text(encoding="utf-8")
+    assert log.count("up") == 3 and "--- restart 2 at" in log  # one log, appended
+
+
+def test_up_exits_only_when_every_agent_is_down(tmp_path):
+    from agentmesh import fleet
+
+    members = [fleet_member(tmp_path, n, "import sys; sys.exit(1)") for n in ("A", "B")]
+    fleet.start(members)
+    t0 = time.monotonic()
+    assert fleet.watch(members, max_restarts=0, poll=0.05) == 1
+    assert time.monotonic() - t0 < 10
+    assert all(m.down and m.restarts == 0 for m in members)

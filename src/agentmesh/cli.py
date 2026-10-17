@@ -73,7 +73,23 @@ def build_parser() -> argparse.ArgumentParser:
     orch.add_argument("--out", type=Path, help="Also write the whole run as one JSON file")
     orch.add_argument("--plan-only", action="store_true", help="Print the plan; send nothing")
     orch.add_argument(
-        "--step-timeout", type=float, default=900.0, help="Seconds per step (default: 900)"
+        "--step-timeout",
+        type=float,
+        default=900.0,
+        help="Seconds per attempt; a timed-out task is cancelled (default: 900)",
+    )
+    orch.add_argument(
+        "--retries", type=int, default=1, help="Retries on the same agent (default: 1)"
+    )
+    orch.add_argument(
+        "--no-fallback",
+        action="store_true",
+        help="Don't hand a failed step to another agent with the same skill",
+    )
+    orch.add_argument(
+        "--push",
+        action="store_true",
+        help="Follow steps by push notification (a webhook on 127.0.0.1) instead of a stream",
     )
     return p
 
@@ -234,26 +250,40 @@ def _fleet_urls(agents_dir: Path) -> list[str]:
 
 
 async def _orchestrate(args: argparse.Namespace) -> int:
-    from agentmesh.orchestrator import OllamaChat, discover_all, orchestrate
+    from agentmesh.client import PushReceiver
+    from agentmesh.orchestrator import OllamaChat, RunPolicy, discover_all, orchestrate
 
     urls = args.agents or _fleet_urls(args.agents_dir)
-    async with httpx.AsyncClient(timeout=args.step_timeout) as http:
-        cards, errors = await discover_all(urls, http)
-        for e in errors:
-            print(f"no card: {e}", file=sys.stderr)
-        for c in cards:
-            print(f"found {c.name}: {', '.join(s.id for s in c.skills)}", file=sys.stderr)
-        out = await orchestrate(
-            args.task,
-            cards,
-            OllamaChat(args.model, args.ollama_url),
-            http,
-            trace_root=args.trace_root,
-            step_timeout=args.step_timeout,
-            plan_only=args.plan_only,
-            on_line=lambda line: print(f"  {line}", file=sys.stderr, flush=True),
-            model_name=args.model,
-        )
+    receiver = await PushReceiver().serve() if args.push else None
+    if receiver is not None:
+        print(f"push notifications to {receiver.url}", file=sys.stderr)
+    policy = RunPolicy(
+        step_timeout=args.step_timeout,
+        retries=args.retries,
+        fallback=not args.no_fallback,
+        push=receiver,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=args.step_timeout) as http:
+            cards, errors = await discover_all(urls, http)
+            for e in errors:
+                print(f"no card: {e}", file=sys.stderr)
+            for c in cards:
+                print(f"found {c.name}: {', '.join(s.id for s in c.skills)}", file=sys.stderr)
+            out = await orchestrate(
+                args.task,
+                cards,
+                OllamaChat(args.model, args.ollama_url),
+                http,
+                trace_root=args.trace_root,
+                policy=policy,
+                plan_only=args.plan_only,
+                on_line=lambda line: print(f"  {line}", file=sys.stderr, flush=True),
+                model_name=args.model,
+            )
+    finally:
+        if receiver is not None:
+            await receiver.close()
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(

@@ -15,8 +15,11 @@ the agents record in their A2A journals. The orchestrator writes its own journal
 in the same formats as the agents (``<trace root>/orchestrator/``), so ``agentmesh watch``
 shows it as one more lane and links it to the tasks it started.
 
-Not here yet (M4): retries, fallback to another agent with the same skill, and cancelling a
-remote task when its step times out (the remote agent keeps working).
+Reliability (M4, see ``RunPolicy``): a failed attempt is retried, then handed to the next
+agent whose card lists the same skill (in discovery order). A timed-out attempt's remote
+task is cancelled, and cancelling the whole orchestration cancels every remote task still
+running. With a ``PushReceiver`` the steps are followed by push notification instead of
+a held-open stream.
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ from typing import Any
 import httpx
 from a2a.types import AgentCard, StreamResponse
 
-from agentmesh.client import ask, discover
+from agentmesh.client import PushReceiver, TaskRun, ask, ask_push, cancel, discover
 from agentmesh.journal import JOURNAL_NAME, JsonlJournal
 
 MAX_STEPS = 6
@@ -385,6 +388,7 @@ class StepResult:
     stats: dict[str, Any] = field(default_factory=dict)
     started: float | None = None
     ended: float | None = None
+    attempts: list[Attempt] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -406,6 +410,7 @@ class StepResult:
             "message": self.message,
             "stats": self.stats,
             "seconds": round(self.ended - self.started, 1) if self.started and self.ended else None,
+            "attempts": [a.to_dict() for a in self.attempts],
         }
 
 
@@ -429,51 +434,161 @@ def step_input(step: Step, results: dict[str, StepResult]) -> str:
     return text
 
 
+@dataclass
+class RunPolicy:
+    """How hard a step tries before it fails.
+
+    A step is tried on the first agent whose card lists its skill. A failure is retried on
+    the same agent up to ``retries`` times (after ``backoff`` seconds, doubling), except a
+    timeout, which is never retried on the same agent. Then, with ``fallback``, the next
+    agent with the skill gets the same treatment. A timed-out attempt's remote task is
+    cancelled, so the agent stops working on it.
+    """
+
+    step_timeout: float = 900.0  # per attempt
+    retries: int = 1
+    backoff: float = 2.0
+    fallback: bool = True
+    push: PushReceiver | None = None  # follow tasks by push notification instead of a stream
+    poll_every: float = 15.0  # push mode: ask the agent if nothing arrived for this long
+
+
+@dataclass
+class Attempt:
+    agent: str
+    url: str
+    task_id: str = ""
+    state: str = "working"
+    message: str = ""
+    seconds: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "agent": self.agent,
+            "url": self.url,
+            "task_id": self.task_id,
+            "state": self.state,
+            "message": self.message,
+            "seconds": round(self.seconds, 1),
+        }
+
+
+async def _attempt(
+    step: Step,
+    skill: Skill,
+    r: StepResult,
+    a: Attempt,
+    http: httpx.AsyncClient,
+    rec: Recorder,
+    policy: RunPolicy,
+) -> TaskRun | None:
+    """One try on one agent. Returns the run, or None when it timed out or the agent was
+    unreachable (``a`` says which). Cancelling this coroutine cancels the remote task."""
+
+    def seen(event: StreamResponse) -> None:
+        kind = event.WhichOneof("payload")
+        tid = event.task.id if kind == "task" else ""
+        if tid and not a.task_id:
+            a.task_id = r.task_id = tid
+            rec.state("working", message=f"{step.id}: {a.agent} took it as task {tid}")
+
+    meta = {"orchestration": rec.run_id, "step": step.id}
+    if policy.push is not None:
+        call = ask_push(
+            skill.card,
+            r.input,
+            http,
+            policy.push,
+            on_event=seen,
+            metadata=meta,
+            poll_every=policy.poll_every,
+        )
+    else:
+        call = ask(skill.card, r.input, http, on_event=seen, metadata=meta)
+    try:
+        return await asyncio.wait_for(call, policy.step_timeout)
+    except TimeoutError:
+        a.state, a.message = "timeout", f"no result after {policy.step_timeout:g} s"
+    except asyncio.CancelledError:
+        if a.task_id:  # the orchestration was cancelled: stop the agent too
+            await asyncio.shield(_cancel_remote(step, skill, a, http, rec))
+        raise
+    except Exception as exc:
+        a.state, a.message = "unreachable", f"{type(exc).__name__}: {exc}"[:500]
+        return None
+    if a.task_id:
+        await _cancel_remote(step, skill, a, http, rec)
+    return None
+
+
+async def _cancel_remote(
+    step: Step, skill: Skill, a: Attempt, http: httpx.AsyncClient, rec: Recorder
+) -> None:
+    try:
+        said = await asyncio.wait_for(cancel(skill.card, a.task_id, http), 10)
+    except TimeoutError:
+        said = "cancel failed: no reply in 10 s"
+    a.message += f"; remote task {said}" if a.message else f"remote task {said}"
+    rec.state("working", message=f"{step.id}: asked {a.agent} to cancel {a.task_id}: {said}")
+
+
 async def _run_one(
     step: Step,
     results: dict[str, StepResult],
     catalogue: Catalogue,
     http: httpx.AsyncClient,
     rec: Recorder,
-    timeout: float,
+    policy: RunPolicy,
 ) -> None:
-    """Runs one step to a terminal state. Never raises: failures go into the result."""
+    """Runs one step to a terminal state. Never raises (except when cancelled): failures,
+    retries and fallbacks go into the result."""
     r = results[step.id]
-    skill = catalogue[step.skill][0]
-    r.agent, r.url = skill.agent, agent_url(skill.card)
     r.input = step_input(step, results)
     r.state, r.started = "working", time.time()
-    rec.state("working", message=f"{step.id}: sending {step.skill} to {r.agent}")
-
-    def seen(event: StreamResponse) -> None:
-        if event.WhichOneof("payload") == "task" and not r.task_id:
-            r.task_id = event.task.id
-            rec.state("working", message=f"{step.id}: {r.agent} took it as task {r.task_id}")
-
-    try:
-        run = await asyncio.wait_for(
-            ask(
-                skill.card,
-                r.input,
-                http,
-                on_event=seen,
-                metadata={"orchestration": rec.run_id, "step": step.id},
-            ),
-            timeout,
-        )
-        r.task_id = run.task_id or r.task_id
-        r.state, r.answer, r.message, r.stats = (
-            run.state or "failed",
-            run.answer,
-            run.final_message,
-            run.stats,
-        )
-        if r.ok and not r.answer.strip():
-            r.state, r.message = "failed", "the agent completed with an empty answer"
-    except TimeoutError:
-        r.state, r.message = "failed", f"no result after {timeout:g} s"
-    except Exception as exc:
-        r.state, r.message = "failed", f"{type(exc).__name__}: {exc}"
+    candidates = catalogue[step.skill] if policy.fallback else catalogue[step.skill][:1]
+    for n, skill in enumerate(candidates):
+        r.agent, r.url = skill.agent, agent_url(skill.card)
+        tries = 0
+        while True:
+            tries += 1
+            a = Attempt(skill.agent, r.url)
+            r.attempts.append(a)
+            r.task_id = ""
+            how = "" if tries == 1 and n == 0 else f" (attempt {len(r.attempts)})"
+            rec.state("working", message=f"{step.id}: sending {step.skill} to {a.agent}{how}")
+            t0 = time.time()
+            run = await _attempt(step, skill, r, a, http, rec, policy)
+            a.seconds = time.time() - t0
+            if run is not None:
+                a.task_id = run.task_id or a.task_id
+                a.state, a.message = run.state or "failed", run.final_message
+                r.answer, r.stats = run.answer, run.stats
+                if a.state == "completed" and not run.answer.strip():
+                    a.state, a.message = "failed", "the agent completed with an empty answer"
+            r.task_id, r.state, r.message = a.task_id, a.state, a.message
+            if a.state == "completed":
+                break
+            rec.state(
+                "working",
+                message=f"{step.id}: {a.agent} {a.state} after {a.seconds:.0f} s: "
+                f"{a.message[:300]}",
+            )
+            # A timeout or a refusal won't go better on the same agent; anything else might.
+            if a.state in ("timeout", "canceled", "rejected") or tries > policy.retries:
+                break
+            await asyncio.sleep(policy.backoff * 2 ** (tries - 1))
+        if r.ok:
+            break
+        if n + 1 < len(candidates):
+            rec.state(
+                "working",
+                message=f"{step.id}: falling back from {skill.agent} to {candidates[n + 1].agent}",
+            )
+    if not r.ok:
+        r.state = "failed"
+        r.answer = ""
+        tried = "; ".join(f"{a.agent}: {a.state}, {a.message[:200]}" for a in r.attempts)
+        r.message = f"every attempt failed ({tried})"
     r.ended = time.time()
     took = f"{r.ended - r.started:.0f} s"
     detail = "" if r.ok else f": {r.message[:300]}"
@@ -481,7 +596,14 @@ async def _run_one(
     rec.event(
         "tool_result",
         step=1,
-        call={"name": r.label, "arguments": {"input": r.input, "task": r.task_id}},
+        call={
+            "name": r.label,
+            "arguments": {
+                "input": r.input,
+                "task": r.task_id,
+                "attempts": [a.to_dict() for a in r.attempts],
+            },
+        },
         ok=r.ok,
         output=r.answer if r.ok else f"{r.state}: {r.message}",
     )
@@ -492,8 +614,10 @@ async def run_steps(
     catalogue: Catalogue,
     http: httpx.AsyncClient,
     rec: Recorder,
-    step_timeout: float,
+    policy: RunPolicy | float,
 ) -> dict[str, StepResult]:
+    if not isinstance(policy, RunPolicy):  # the M3 signature passed a step timeout
+        policy = RunPolicy(step_timeout=float(policy))
     results = {s.id: StepResult(s) for s in plan}
     waiting = {s.id: s for s in plan}
     running: set[asyncio.Task[None]] = set()
@@ -521,13 +645,22 @@ async def run_steps(
                 elif all(d.ok for d in deps):
                     del waiting[sid]
                     running.add(
-                        asyncio.ensure_future(
-                            _run_one(s, results, catalogue, http, rec, step_timeout)
-                        )
+                        asyncio.ensure_future(_run_one(s, results, catalogue, http, rec, policy))
                     )
         if not running:
             break
-        done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+        try:
+            done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            # The orchestration was cancelled: cancel every running step, which cancels its
+            # remote task, and wait for that cleanup before giving up.
+            for t in running:
+                t.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
+            for r in results.values():
+                if r.state in ("pending", "working"):
+                    r.state, r.message = "canceled", "the orchestration was cancelled"
+            raise
         for t in done:
             t.result()  # _run_one doesn't raise; surface a bug if it does
     return results
@@ -591,13 +724,38 @@ async def orchestrate(
     *,
     trace_root: Path | None = None,
     step_timeout: float = 900.0,
+    policy: RunPolicy | None = None,
     plan_only: bool = False,
     on_line: Callable[[str], None] | None = None,
     model_name: str = "",
 ) -> Orchestration:
+    """Plan, run and combine. ``policy`` sets retries, fallback and push; without one, each
+    step gets ``step_timeout`` and the default policy. Cancelling this coroutine cancels
+    every remote task still running and records the run as canceled."""
+    policy = policy or RunPolicy(step_timeout=step_timeout)
     run_id = str(uuid.uuid4())
     rec = Recorder(trace_root / "orchestrator" if trace_root else None, run_id, on_line)
     out = Orchestration(run_id, task, trace=rec.trace)
+    try:
+        return await _orchestrate(task, cards, chat, http, rec, out, policy, plan_only, model_name)
+    except asyncio.CancelledError:
+        out.state, out.message = "canceled", "the orchestration was cancelled"
+        rec.event("run_end", stop_reason="cancelled", answer="")
+        rec.state("canceled", message=out.message)
+        raise
+
+
+async def _orchestrate(
+    task: str,
+    cards: list[AgentCard],
+    chat: Chat,
+    http: httpx.AsyncClient,
+    rec: Recorder,
+    out: Orchestration,
+    policy: RunPolicy,
+    plan_only: bool,
+    model_name: str,
+) -> Orchestration:
     catalogue = build_catalogue(cards)
 
     def finish(state: str, message: str = "", stop: str = "final_answer") -> Orchestration:
@@ -661,7 +819,7 @@ async def orchestrate(
         out.answer = json.dumps({"steps": [s.to_dict() for s in out.plan]}, indent=2)
         return finish("completed")
 
-    out.results = await run_steps(out.plan, catalogue, http, rec, step_timeout)
+    out.results = await run_steps(out.plan, catalogue, http, rec, policy)
     rec.state("working", message="combining the results")
     try:
         reply = await combine(task, out.plan, out.results, chat)

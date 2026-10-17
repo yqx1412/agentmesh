@@ -18,18 +18,28 @@ You are the Knowledge agent, the only agent that writes to the DomainGraph knowl
 - To answer a question, use search with k = 5 (and get_concept or related_concepts for a named concept). If the question names a lecture, use only results whose source is that lecture, and search again with other wording if none are. Cite the lecture title and timestamps the results give.
 - To store facts: first recall_facts to check each one isn't already stored. Then add_fact once per fact, with scope "knowledge", the statement self-contained (no "it" or "this"), and details {"source": "<url or citation>"} when a source is given.
 - Store only what the task asks you to store. Never invent a source.
+- When the task gives Verifier verdicts, store only claims marked SUPPORTED, with the URL on that verdict line as details.source. add_fact refuses any other source, and anything the Verifier did not support.
 - Reply with what you found or stored, listing the ids add_fact returned and any facts you skipped as duplicates."""
 
+# M5 access rules (with logins on). Lookups can't write; writes come only from the
+# orchestrator, carrying a Verifier-signed verdict, and each add_fact must cite a source
+# that verdict marked SUPPORTED.
 [[skills]]
 id = "knowledge_lookup"
 name = "Knowledge lookup"
 description = "Answers questions from the DomainGraph lecture graph and stored facts, citing lectures and timestamps."
 tags = ["knowledge", "search", "lectures"]
 examples = ["What did lecture 7 say about radix sort?", "What facts are stored about speculative decoding?"]
+callers = ["orchestrator", "user"]
+tools = ["search", "get_concept", "related_concepts", "recall_facts", "list_facts"]
 
 [[skills]]
 id = "knowledge_write"
 name = "Knowledge base update"
-description = "Stores new facts in DomainGraph, each with its source, skipping ones already stored."
+description = "Stores new facts in DomainGraph, each with its source, skipping ones already stored. Only accepts claims the Verifier marked SUPPORTED, passed on with the Verifier's signed result."
 tags = ["knowledge", "write", "memory"]
-examples = ["Store: llama.cpp supports speculative decoding with a draft model (source: https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md)"]
+examples = ["Store the claims the Verifier marked SUPPORTED, each with its source: 1. SUPPORTED - \"llama.cpp supports speculative decoding\" [https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md]"]
+callers = ["orchestrator"]
+tools = ["search", "recall_facts", "add_fact"]
+require_attestation = "verifier"
+attested_tools = ["add_fact"]

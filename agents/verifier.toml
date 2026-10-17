@@ -11,6 +11,9 @@ builtin_tools = []
 # qwen3:14b restated claims as "quotes"; the runtime refuses quotes no fetched page contains.
 check_quotes = true
 require_before_answer = { fetch_url = 1 }
+# M5: every completed verdict is signed with keys/verifier.key; the Knowledge agent stores
+# only what a signed verdict marks SUPPORTED.
+attest_as = "verifier"
 workspace = "../workspace/verifier"
 agentos_config = "verifier.agentos.toml"
 instructions = """\

@@ -35,8 +35,8 @@ Final Answer: 410.90
   text, and `ask` exits with code 3.
 - **Workspace:** file tools are confined to the spec's `workspace` folder
   (git-ignored).
-- **No authentication:** the server binds to `127.0.0.1` unless the spec sets
-  `host`. Don't expose it on a network.
+- **No authentication (until M5):** the server binds to `127.0.0.1` unless the spec
+  sets `host`. Don't expose it on a network. M5 adds logins; see below.
 - `--trace-dir` writes an AgentOS trace per task; `ask --no-stream` sends one
   blocking request instead of streaming.
 
@@ -142,6 +142,55 @@ uv run agentmesh orchestrate "..." --push            # follow steps by webhook
   orchestrator gives each task a webhook on `127.0.0.1` instead of holding a
   stream open. Agents accept webhooks only on loopback addresses, so an agent
   can't be used to POST to other hosts.
+
+## M5: security
+
+Agents now need a login, each skill says who may use it, and the Knowledge agent
+writes only what the Verifier signed off on.
+
+```powershell
+uv run agentmesh auth init                 # secrets/ (git-ignored): tokens + Verifier key
+uv run agentmesh up --trace-dir runs/fleet-traces          # logins on by default
+uv run agentmesh ask http://127.0.0.1:9114 "What is radix sort?" --skill knowledge_lookup
+uv run agentmesh orchestrate "Research local LLM inference and update my knowledge base"
+```
+
+- **Logins:** every caller (principal) has its own random bearer token in
+  `secrets/tokens/<name>.token`; `ask` logs in as `user`, `orchestrate` as
+  `orchestrator` (`--as` changes it). Agents keep only each token's SHA-256 in
+  `secrets/principals.toml`. A JSON-RPC request without a known token gets HTTP 401;
+  the Agent Card stays public, and it advertises the bearer scheme. Tasks are scoped to
+  the principal that created them, so one caller can't read or cancel another's task.
+  `serve`/`up` refuse to start without the auth folder unless given `--insecure`.
+- **Per-skill access:** a request names the skill it wants (`ask --skill`; the
+  orchestrator sends each step's skill). A skill in a spec lists its `callers` and the
+  `tools` a task under it may use. A caller not on the list is `rejected`. An agent
+  with several skills rejects a request that doesn't name one.
+- **Writes only from the Verifier:** the Verifier signs every completed verdict
+  (input + answer) with an Ed25519 key only it holds (`attest_as = "verifier"`). The
+  orchestrator passes a step's signed results on to the steps that depend on it, but
+  can't produce one itself. Knowledge's `knowledge_write` skill
+  (`require_attestation = "verifier"`) is `rejected` without a valid signature, and a
+  forged, altered or stale one (over an hour old) is rejected too. With one, each
+  `add_fact` call must cite a source URL that a signed verdict marked SUPPORTED, at most
+  once per supported claim; anything else comes back to the model as an error.
+  `knowledge_lookup` gets no write tool at all.
+
+| Who asks Knowledge to write | Result |
+|---|---|
+| `user` | rejected: only `orchestrator` may use `knowledge_write` |
+| `orchestrator`, no Verifier signature | rejected |
+| `orchestrator`, forged or altered signature | rejected |
+| `orchestrator`, valid signature | runs; `add_fact` refuses sources the verdict didn't support |
+
+**Limits:** tokens travel over plain HTTP, so the agents still bind to `127.0.0.1`.
+All secrets sit in one folder that every agent process can read. What keeps an
+agent's model away from it is the AgentOS tool confinement: file tools stay in the
+workspace, and the `run_python` sandbox refuses file access outside it. That
+contains a confused model, not a hostile one. The next step would be separate OS
+users or containers per agent. The source check matches URLs, not statements: a claim
+the Verifier never saw can still be stored under a URL that supported some other
+claim, as long as the per-claim count allows it.
 
 ## Development
 

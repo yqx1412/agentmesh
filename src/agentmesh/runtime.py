@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import threading
@@ -16,8 +17,9 @@ from agentos.config import AgentOSConfig, load_config
 from agentos.llm import ChatResponse, Message, OllamaLLM
 from agentos.mcp_client import MCPManager
 from agentos.sandbox import sandbox_tools
-from agentos.tools import Policy, Tool, ToolRegistry
+from agentos.tools import Policy, Tool, ToolError, ToolRegistry
 
+from agentmesh.access import GRANT, Grant
 from agentmesh.executor import TASK_ID, Cancelled, Progress, Runner, RunOutcome
 from agentmesh.spec import SANDBOX_TOOLS, AgentSpec
 
@@ -167,6 +169,37 @@ def _mcp_log(trace_dir: Path | None) -> TextIO:
     return (trace_dir / "mcp.log").open("a", encoding="utf-8")
 
 
+def apply_grant(tools: list[Tool], grant: Grant | None) -> list[Tool]:
+    """M5: only the tools the task's skill allows, and every attested tool gated on a
+    source the Verifier signed off on (see ``access.Grant.spend``). No grant, no change."""
+    if grant is None:
+        return tools
+    out = []
+    for tool in tools:
+        if not grant.allows_tool(tool.name):
+            continue
+        if grant.is_attested(tool.name):
+            tool = dataclasses.replace(tool, fn=_attested(tool, grant))
+        out.append(tool)
+    return out
+
+
+def _attested(tool: Tool, grant: Grant):
+    inner = tool.fn
+
+    def call(args: Any) -> Any:
+        url, why = grant.spend(tool.name, args)
+        if why is not None:
+            raise ToolError(why)
+        try:
+            return inner(args)
+        except Exception:
+            grant.refund(url)  # a failed write doesn't use up the claim
+            raise
+
+    return call
+
+
 def select_tools(spec: AgentSpec, config: AgentOSConfig) -> list[Tool]:
     """The built-in tools the spec names, in the spec's order (sandbox ones included)."""
     available = {t.name: t for t in builtin_tools(spec.workspace)}
@@ -187,6 +220,7 @@ def agentos_runner(spec: AgentSpec, trace_dir: Path | None = None) -> Runner:
     prompt = system_prompt(spec)
 
     def run(task: str, progress: Progress, flag: threading.Event) -> RunOutcome:
+        grant = GRANT.get()
         trace = None
         if trace_dir is not None:
             # Named after the A2A task (see executor.TASK_ID) so `agentmesh watch` can join
@@ -201,7 +235,7 @@ def agentos_runner(spec: AgentSpec, trace_dir: Path | None = None) -> Runner:
                 MCPManager(config.enabled_servers(spec.workspace), errlog=mcp_log) as mcp,
             ):
                 registry = ToolRegistry(
-                    [*select_tools(spec, config), *mcp.tools()],
+                    apply_grant([*select_tools(spec, config), *mcp.tools()], grant),
                     policy=Policy(auto_approve=spec.allow),
                 )
                 model: Any = CancellableLLM(llm, flag)

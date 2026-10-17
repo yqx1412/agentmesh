@@ -8,6 +8,9 @@ Lifecycle, as the A2A client sees it:
 - ``completed``: the answer as a ``result`` artifact, with run statistics in its metadata.
 - ``failed``: the agent stopped without a final answer, or the model or a tool server failed.
 - ``canceled``: the client cancelled; the agent stops before its next model call.
+- ``rejected``: the request has no text, or (with logins on, M5) the caller may not use the
+  skill it asked for; see ``access.py``. A signing agent adds an ``attestation`` artifact
+  to every completed task.
 
 AgentOS is synchronous, so each run happens in a worker thread. Progress crosses back into
 the event loop through ``loop.call_soon_threadsafe``.
@@ -29,6 +32,8 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
 from a2a.types import Part, TaskState
+
+from agentmesh.access import GRANT, Access, Refused
 
 log = logging.getLogger(__name__)
 
@@ -84,23 +89,48 @@ def _agent_text(updater: TaskUpdater, text: str):
     return updater.new_agent_message([Part(text=text)])
 
 
+def _meta_str(context: RequestContext, key: str, limit: int = 100) -> str:
+    msg = context.message
+    if msg is None or not msg.HasField("metadata") or key not in msg.metadata.fields:
+        return ""
+    value = msg.metadata.fields[key]
+    return value.string_value[:limit] if value.WhichOneof("kind") == "string_value" else ""
+
+
+def _meta_strings(context: RequestContext, key: str) -> list[str]:
+    msg = context.message
+    if msg is None or not msg.HasField("metadata") or key not in msg.metadata.fields:
+        return []
+    value = msg.metadata.fields[key]
+    if value.WhichOneof("kind") != "list_value":
+        return []
+    return [
+        v.string_value for v in value.list_value.values if v.WhichOneof("kind") == "string_value"
+    ]
+
+
 def _origin(context: RequestContext) -> dict[str, str]:
     """The orchestration run and step that sent this task, from the message metadata."""
-    msg = context.message
-    if msg is None or not msg.HasField("metadata"):
-        return {}
-    meta = msg.metadata
     out = {}
     for key in ("orchestration", "step"):
-        if key in meta.fields and meta.fields[key].WhichOneof("kind") == "string_value":
-            out[key] = meta.fields[key].string_value[:100]
+        if value := _meta_str(context, key):
+            out[key] = value
     return out
 
 
+def _caller(context: RequestContext) -> str:
+    """The logged-in principal ("" without auth)."""
+    user = context.call_context.user if context.call_context else None
+    return user.user_name if user is not None and user.is_authenticated else ""
+
+
 class AgentOSExecutor(AgentExecutor):
-    def __init__(self, runner: Runner, journal: Journal | None = None) -> None:
+    def __init__(
+        self, runner: Runner, journal: Journal | None = None, access: Access | None = None
+    ) -> None:
         self.runner = runner
         self.journal = journal
+        self.access = access  # None: no logins (tests, `serve --insecure`)
         self._cancel_flags: dict[str, threading.Event] = {}
 
     def _log(self, task_id: str, context_id: str, state: str, **data: Any) -> None:
@@ -122,12 +152,25 @@ class AgentOSExecutor(AgentExecutor):
             self._log(task.id, task.context_id, state, **data)
 
         text = get_message_text(context.message).strip() if context.message else ""
-        note("submitted", text=text[:_PREVIEW], **_origin(context))
+        caller, skill = _caller(context), _meta_str(context, "skill")
+        who = {k: v for k, v in (("caller", caller), ("skill", skill)) if v}
+        note("submitted", text=text[:_PREVIEW], **_origin(context), **who)
         if not text:
             msg = "The request has no text to act on."
             await updater.reject(_agent_text(updater, msg))
             note("rejected", message=msg)
             return
+
+        grant = None
+        if self.access is not None:
+            try:
+                grant = self.access.admit(caller, skill, _meta_strings(context, "attestations"))
+            except Refused as exc:
+                msg = f"Refused: {exc}"
+                await updater.reject(_agent_text(updater, msg))
+                note("rejected", message=msg)
+                return
+        GRANT.set(grant)
 
         TASK_ID.set(task.id)
         await updater.start_work(_agent_text(updater, "Starting the agent."))
@@ -173,8 +216,16 @@ class AgentOSExecutor(AgentExecutor):
             await updater.add_artifact(
                 [Part(text=outcome.answer)], name="result", metadata=outcome.stats()
             )
+            signed = None
+            if self.access is not None:
+                signed = self.access.sign(
+                    task=task.id, caller=caller, input=text, answer=outcome.answer
+                )
+            if signed:
+                await updater.add_artifact([Part(text=signed)], name="attestation")
             await updater.complete()
-            note("completed", answer=outcome.answer[:_PREVIEW], stats=outcome.stats())
+            extra = {"signed_as": self.access.signer} if signed and self.access else {}
+            note("completed", answer=outcome.answer[:_PREVIEW], stats=outcome.stats(), **extra)
         else:
             detail = f"stopped without a final answer ({outcome.stop_reason})"
             if outcome.answer:

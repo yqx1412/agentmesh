@@ -1,4 +1,5 @@
-"""``agentmesh serve <spec> | up | watch | card <url> | ask <url> <task>``."""
+"""``agentmesh serve <spec> | up | watch | card <url> | ask <url> <task> | orchestrate <task> |
+auth init``."""
 
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import httpx
 from google.protobuf.json_format import MessageToDict
 
 from agentmesh import __version__
+from agentmesh.auth import DEFAULT_DIR, DEFAULT_PRINCIPALS, DEFAULT_SIGNERS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -23,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("spec", type=Path, help="Agent spec (TOML)")
     serve.add_argument("--port", type=int, help="Override the spec's port")
     serve.add_argument("--trace-dir", type=Path, help="Write an AgentOS trace per task here")
+    _server_auth_args(serve)
 
     up = sub.add_parser("up", help="Start several agents, one process each (default: M2 four)")
     up.add_argument("specs", type=Path, nargs="*", help="Agent specs (default: the specialists)")
@@ -42,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="Seconds before the first restart, doubling each time (default: 2)",
     )
+    _server_auth_args(up)
 
     watch = sub.add_parser("watch", help="Live page of every agent's A2A tasks and steps")
     watch.add_argument(
@@ -61,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("task")
     ask.add_argument("--no-stream", action="store_true", help="One blocking request")
     ask.add_argument("--timeout", type=float, default=900.0, help="Seconds (default: 900)")
+    ask.add_argument("--skill", help="The card skill to use (needed when the agent has several)")
+    _client_auth_args(ask, "user")
 
     orch = sub.add_parser(
         "orchestrate", help="Split a task across the agents found by their Agent Cards"
@@ -103,7 +109,58 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Follow steps by push notification (a webhook on 127.0.0.1) instead of a stream",
     )
+    _client_auth_args(orch, "orchestrator")
+
+    auth = sub.add_parser("auth", help="Logins between agents (M5)")
+    auth_sub = auth.add_subparsers(dest="auth_command")
+    init = auth_sub.add_parser("init", help="Issue a token per principal and a key per signer")
+    init.add_argument("--auth-dir", type=Path, default=DEFAULT_DIR, help="Default: secrets")
+    init.add_argument(
+        "--principal",
+        dest="principals",
+        action="append",
+        help=f"A caller that gets a token; repeat it (default: {', '.join(DEFAULT_PRINCIPALS)})",
+    )
+    init.add_argument(
+        "--signer",
+        dest="signers",
+        action="append",
+        help=f"An agent that signs results; repeat it (default: {', '.join(DEFAULT_SIGNERS)})",
+    )
+    init.add_argument("--force", action="store_true", help="Replace existing tokens and keys")
     return p
+
+
+def _server_auth_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--auth-dir",
+        type=Path,
+        default=DEFAULT_DIR,
+        help="From `agentmesh auth init` (default: secrets)",
+    )
+    p.add_argument(
+        "--insecure",
+        action="store_true",
+        help="No logins and no access rules: anyone who reaches the port may use every skill",
+    )
+
+
+def _client_auth_args(p: argparse.ArgumentParser, default: str) -> None:
+    p.add_argument("--auth-dir", type=Path, default=DEFAULT_DIR, help="Default: secrets")
+    p.add_argument(
+        "--as", dest="principal", default=default, help=f"Log in as (default: {default})"
+    )
+
+
+def _client_headers(args: argparse.Namespace) -> dict[str, str]:
+    """The bearer header for ``--as``, or none (with a warning) when there is no token."""
+    from agentmesh.auth import AuthError, auth_headers
+
+    try:
+        return auth_headers(args.auth_dir, args.principal)
+    except AuthError as exc:
+        print(f"not logging in: {exc}", file=sys.stderr)
+        return {}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -120,13 +177,45 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_ask(args))
     if args.command == "orchestrate":
         return asyncio.run(_orchestrate(args))
+    if args.command == "auth" and args.auth_command == "init":
+        return _auth_init(args)
     build_parser().print_help()
     return 0
+
+
+def _auth_init(args: argparse.Namespace) -> int:
+    from agentmesh.auth import AuthError, init_auth
+
+    try:
+        written = init_auth(
+            args.auth_dir,
+            args.principals or DEFAULT_PRINCIPALS,
+            args.signers or DEFAULT_SIGNERS,
+            force=args.force,
+        )
+    except AuthError as exc:
+        print(f"auth error: {exc}", file=sys.stderr)
+        return 2
+    for path in written:
+        print(path)
+    print("Keep this folder private. Restart running agents to pick up new secrets.")
+    return 0
+
+
+def _server_auth(args: argparse.Namespace):
+    """The auth config for ``serve`` (None with --insecure); raises AuthError."""
+    from agentmesh.auth import AuthConfig
+
+    if args.insecure:
+        print("--insecure: no logins, every skill open to anyone on this port", file=sys.stderr)
+        return None
+    return AuthConfig.load(args.auth_dir)
 
 
 def _serve(args: argparse.Namespace) -> int:
     import uvicorn
 
+    from agentmesh.auth import AuthError
     from agentmesh.runtime import agentos_runner
     from agentmesh.server import build_app
     from agentmesh.spec import SpecError, load_spec
@@ -143,8 +232,14 @@ def _serve(args: argparse.Namespace) -> int:
         from agentmesh.journal import JOURNAL_NAME, JsonlJournal
 
         journal = JsonlJournal(args.trace_dir / JOURNAL_NAME, spec.name)
-    app = build_app(spec, agentos_runner(spec, args.trace_dir), journal)
-    print(f"{spec.name} on {spec.url} (model {spec.model}, workspace {spec.workspace})")
+    try:
+        auth = _server_auth(args)
+        app = build_app(spec, agentos_runner(spec, args.trace_dir), journal, auth=auth)
+    except AuthError as exc:
+        print(f"auth error: {exc} (or pass --insecure)", file=sys.stderr)
+        return 2
+    login = "logins required" if auth is not None else "NO LOGINS"
+    print(f"{spec.name} on {spec.url} (model {spec.model}, workspace {spec.workspace}, {login})")
     uvicorn.run(app, host=spec.host, port=spec.port, log_level="warning")
     return 0
 
@@ -162,7 +257,21 @@ def _up(args: argparse.Namespace) -> int:
     except SpecError as exc:
         print(f"spec error: {exc}", file=sys.stderr)
         return 2
-    fleet.start(members, args.trace_dir)
+    if args.insecure:
+        auth_args = ["--insecure"]
+    else:
+        from agentmesh.access import Access
+        from agentmesh.auth import AuthConfig, AuthError
+
+        try:  # fail here, once, rather than in every child
+            auth = AuthConfig.load(args.auth_dir)
+            for m in members:
+                Access(m.spec, auth)
+        except AuthError as exc:
+            print(f"auth error: {exc} (or pass --insecure)", file=sys.stderr)
+            return 2
+        auth_args = ["--auth-dir", str(args.auth_dir.resolve())]
+    fleet.start(members, args.trace_dir, auth_args)
     try:
         cards = fleet.wait_ready(members, args.ready_timeout)
     except (RuntimeError, TimeoutError) as exc:
@@ -221,7 +330,7 @@ async def _card(args: argparse.Namespace) -> int:
 async def _ask(args: argparse.Namespace) -> int:
     from agentmesh.client import ask, discover, state_name
 
-    async with httpx.AsyncClient(timeout=args.timeout) as http:
+    async with httpx.AsyncClient(timeout=args.timeout, headers=_client_headers(args)) as http:
         card = await discover(args.url, http)
         skills = ", ".join(s.id for s in card.skills)
         print(f"found {card.name!r} at {args.url}, skills: {skills}", file=sys.stderr)
@@ -236,7 +345,14 @@ async def _ask(args: argparse.Namespace) -> int:
                 t = event.task
                 print(f"  [{state_name(t.status.state)}] task {t.id}", file=sys.stderr)
 
-        run = await ask(card, args.task, http, streaming=not args.no_stream, on_event=show)
+        run = await ask(
+            card,
+            args.task,
+            http,
+            streaming=not args.no_stream,
+            on_event=show,
+            metadata={"skill": args.skill} if args.skill else None,
+        )
     if run.answer:
         print(run.answer)
     if run.final_message:
@@ -276,7 +392,9 @@ async def _orchestrate(args: argparse.Namespace) -> int:
         push=receiver,
     )
     try:
-        async with httpx.AsyncClient(timeout=args.step_timeout) as http:
+        async with httpx.AsyncClient(
+            timeout=args.step_timeout, headers=_client_headers(args)
+        ) as http:
             cards, errors = await discover_all(urls, http)
             for e in errors:
                 print(f"no card: {e}", file=sys.stderr)

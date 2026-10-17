@@ -1,8 +1,9 @@
 """``agentmesh up``: start several agents, each as its own ``agentmesh serve`` process.
 
 Each process gets its own spec (model, tools, workspace, port) and its own log file. The
-launcher waits until every agent serves its Agent Card, prints one line per agent, and
-stops them all on Ctrl+C or as soon as one of them exits.
+launcher waits until every agent serves its Agent Card, prints one line per agent, then
+supervises them: an agent that exits is restarted (with backoff, up to a limit) while the
+others keep running, so one dead agent never takes the fleet down. Ctrl+C stops them all.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +32,9 @@ class Member:
     spec: AgentSpec
     log: Path
     proc: subprocess.Popen | None = None
+    cmd: list[str] | None = None  # set by start(); tests may set it directly
+    restarts: int = 0
+    down: bool = False  # exited and out of restarts
 
 
 def default_specs(agents_dir: Path) -> list[Path]:
@@ -60,15 +65,25 @@ def port_free(host: str, port: int) -> bool:
 
 def start(members: list[Member], trace_dir: Path | None = None) -> None:
     for m in members:
-        m.log.parent.mkdir(parents=True, exist_ok=True)
-        cmd = [sys.executable, "-m", "agentmesh", "serve", str(m.path)]
-        if trace_dir is not None:
-            cmd += ["--trace-dir", str(trace_dir / m.path.stem)]
-        log = m.log.open("w", encoding="utf-8")
-        # Unbuffered, so the log shows the startup line and errors as they happen.
-        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-        m.proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
-        log.close()  # the child holds its own handle
+        if m.cmd is None:
+            m.cmd = [sys.executable, "-m", "agentmesh", "serve", str(m.path)]
+            if trace_dir is not None:
+                m.cmd += ["--trace-dir", str(trace_dir / m.path.stem)]
+        launch(m)
+
+
+def launch(m: Member, append: bool = False) -> None:
+    """Start (or restart) one member's process. A restart appends to the same log."""
+    assert m.cmd is not None
+    m.log.parent.mkdir(parents=True, exist_ok=True)
+    log = m.log.open("a" if append else "w", encoding="utf-8")
+    if append:
+        log.write(f"\n--- restart {m.restarts} at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        log.flush()
+    # Unbuffered, so the log shows the startup line and errors as they happen.
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    m.proc = subprocess.Popen(m.cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
+    log.close()  # the child holds its own handle
 
 
 def wait_ready(members: list[Member], timeout: float = 60.0) -> dict[str, dict]:
@@ -123,20 +138,62 @@ def describe(m: Member, card: dict) -> str:
     )
 
 
-def watch(members: list[Member]) -> int:
-    """Block until Ctrl+C (exit 0) or until any agent exits (exit 1); then stop the rest."""
+def watch(
+    members: list[Member],
+    max_restarts: int = 3,
+    backoff: float = 2.0,
+    poll: float = 0.5,
+    stop_event: threading.Event | None = None,
+) -> int:
+    """Supervise the fleet until Ctrl+C or ``stop_event`` (exit 0), then stop every agent.
+
+    An agent that exits is restarted after ``backoff * 2**n`` seconds, at most
+    ``max_restarts`` times; the other agents keep running throughout. An agent out of
+    restarts stays down. Returns 1 only when every agent is down.
+    """
+    due: dict[int, float] = {}  # member index -> monotonic time its restart is due
     try:
-        while True:
-            for m in members:
+        while stop_event is None or not stop_event.is_set():
+            now = time.monotonic()
+            for i, m in enumerate(members):
                 assert m.proc is not None
-                if m.proc.poll() is not None:
+                if m.down or m.proc.poll() is None:
+                    continue
+                if i in due:
+                    if now >= due[i]:
+                        del due[i]
+                        m.restarts += 1
+                        launch(m, append=True)
+                        print(
+                            f"{m.spec.name} ({m.spec.url}) restarted "
+                            f"({m.restarts}/{max_restarts}), pid {m.proc.pid}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    continue
+                code = m.proc.returncode
+                if m.restarts >= max_restarts:
+                    m.down = True
                     print(
-                        f"{m.spec.name} exited with code {m.proc.returncode}; stopping the "
-                        f"others (log: {m.log})",
+                        f"{m.spec.name} ({m.spec.url}) exited with code {code} and is out of "
+                        f"restarts; it stays down, the others keep running (log: {m.log})",
                         file=sys.stderr,
+                        flush=True,
                     )
-                    return 1
-            time.sleep(0.5)
+                    continue
+                delay = backoff * 2**m.restarts
+                due[i] = now + delay
+                print(
+                    f"{m.spec.name} ({m.spec.url}) exited with code {code}; restarting in "
+                    f"{delay:g} s, the others keep running (log: {m.log})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if all(m.down for m in members):
+                print("every agent is down; exiting", file=sys.stderr)
+                return 1
+            time.sleep(poll)
+        return 0
     except KeyboardInterrupt:
         print("stopping...", file=sys.stderr)
         return 0

@@ -43,7 +43,9 @@ Final Answer: 410.90
 ## M2: four specialist agents
 
 `agentmesh up` starts four specialists, each as its own A2A process, and waits
-until every Agent Card is served. Ctrl+C stops them all.
+until every Agent Card is served. Ctrl+C stops them all. An agent that exits is
+restarted on its own (2 s backoff, doubling, up to `--max-restarts`, default 3)
+while the others keep running, so one dead agent never takes the fleet down.
 
 | Agent | Port | Model | Tools |
 |---|---|---|---|
@@ -118,6 +120,28 @@ uv run agentmesh orchestrate "..." --plan-only       # print the plan, send noth
   A2A message metadata, and each agent's journal records them. The orchestrator
   writes its own trace to `runs/fleet-traces/orchestrator/`, so `watch` shows
   it as the first lane and links it to its child tasks.
+
+## M4: reliability
+
+The orchestrator now survives an agent that fails, hangs or dies mid-task.
+
+```powershell
+uv run agentmesh orchestrate "..." --retries 2 --step-timeout 300
+uv run agentmesh orchestrate "..." --no-fallback     # never switch agents
+uv run agentmesh orchestrate "..." --push            # follow steps by webhook
+```
+
+- **Retries:** a failed attempt is retried on the same agent (`--retries`,
+  default 1).
+- **Fallback:** when the retries run out, the step goes to the next agent whose
+  card lists the same skill, in discovery order. `--no-fallback` turns this off.
+- **Timeouts cancel:** `--step-timeout` now bounds each attempt, and a timed-out
+  attempt's remote task is cancelled over A2A, so the agent stops working on it.
+  Cancelling the whole orchestration cancels every remote task still running.
+- **Push notifications:** agents advertise A2A push support. With `--push` the
+  orchestrator gives each task a webhook on `127.0.0.1` instead of holding a
+  stream open. Agents accept webhooks only on loopback addresses, so an agent
+  can't be used to POST to other hosts.
 
 ## Development
 

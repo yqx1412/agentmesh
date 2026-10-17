@@ -20,6 +20,10 @@ agent whose card lists the same skill (in discovery order). A timed-out attempt'
 task is cancelled, and cancelling the whole orchestration cancels every remote task still
 running. With a ``PushReceiver`` the steps are followed by push notification instead of
 a held-open stream.
+
+Security (M5): every delegated message names the skill it wants, so the agent can check the
+orchestrator may use it, and carries the signed results of the steps it depends on
+(``attestations``). The orchestrator logs in with its own token (``orchestrate --as``).
 """
 
 from __future__ import annotations
@@ -389,6 +393,8 @@ class StepResult:
     started: float | None = None
     ended: float | None = None
     attempts: list[Attempt] = field(default_factory=list)
+    attestation: str = ""  # this step's signed result, when its agent signs (M5)
+    attestations: list[str] = field(default_factory=list)  # forwarded from dependencies
 
     @property
     def ok(self) -> bool:
@@ -411,6 +417,8 @@ class StepResult:
             "stats": self.stats,
             "seconds": round(self.ended - self.started, 1) if self.started and self.ended else None,
             "attempts": [a.to_dict() for a in self.attempts],
+            "signed": bool(self.attestation),
+            "forwarded_signatures": len(self.attestations),
         }
 
 
@@ -492,7 +500,9 @@ async def _attempt(
             a.task_id = r.task_id = tid
             rec.state("working", message=f"{step.id}: {a.agent} took it as task {tid}")
 
-    meta = {"orchestration": rec.run_id, "step": step.id}
+    meta: dict[str, Any] = {"orchestration": rec.run_id, "step": step.id, "skill": step.skill}
+    if r.attestations:
+        meta["attestations"] = list(r.attestations)
     if policy.push is not None:
         call = ask_push(
             skill.card,
@@ -544,6 +554,9 @@ async def _run_one(
     retries and fallbacks go into the result."""
     r = results[step.id]
     r.input = step_input(step, results)
+    # M5: hand on every signed result this step depends on (the Knowledge agent only
+    # writes what the Verifier signed). The orchestrator can relay them but not make one.
+    r.attestations = [results[d].attestation for d in step.depends_on if results[d].attestation]
     r.state, r.started = "working", time.time()
     candidates = catalogue[step.skill] if policy.fallback else catalogue[step.skill][:1]
     for n, skill in enumerate(candidates):
@@ -563,6 +576,7 @@ async def _run_one(
                 a.task_id = run.task_id or a.task_id
                 a.state, a.message = run.state or "failed", run.final_message
                 r.answer, r.stats = run.answer, run.stats
+                r.attestation = run.attestation
                 if a.state == "completed" and not run.answer.strip():
                     a.state, a.message = "failed", "the agent completed with an empty answer"
             r.task_id, r.state, r.message = a.task_id, a.state, a.message

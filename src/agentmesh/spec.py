@@ -52,6 +52,24 @@ class SkillSpec(BaseModel):
     description: str
     tags: list[str] = Field(default_factory=list)
     examples: list[str] = Field(default_factory=list)
+    # M5 access rules (enforced only when the agent runs with an auth folder).
+    # Principals allowed to ask for this skill.
+    callers: list[str] = Field(default_factory=lambda: ["orchestrator", "user"])
+    # Tools a task under this skill may use (built-in or MCP names); None = all of them.
+    tools: list[str] | None = None
+    # A signer (e.g. "verifier") whose signed result must come with the request.
+    require_attestation: str | None = None
+    # Tools whose calls must cite a source that signed result marked SUPPORTED, at most
+    # once per supporting claim (e.g. ["add_fact"]).
+    attested_tools: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _attested_needs_signer(self) -> SkillSpec:
+        if self.attested_tools and not self.require_attestation:
+            raise ValueError(f"skill {self.id}: attested_tools needs require_attestation")
+        if not self.callers:
+            raise ValueError(f"skill {self.id}: callers is empty, so nobody could use it")
+        return self
 
 
 class AgentSpec(BaseModel):
@@ -60,7 +78,8 @@ class AgentSpec(BaseModel):
     name: str
     description: str
     version: str = "0.1.0"
-    # Loopback by default: M1 has no authentication (that's M5), so nothing else should reach it.
+    # Loopback by default. M5 adds logins, but tokens travel over plain HTTP, so the mesh
+    # still stays on one machine.
     host: str = "127.0.0.1"
     port: int = Field(ge=1, le=65535)
     model: str = "qwen3:8b"
@@ -89,6 +108,8 @@ class AgentSpec(BaseModel):
     think: bool = False
     workspace: Path
     agentos_config: Path | None = None
+    # M5: sign every completed result with this signer's key (keys/<name>.key).
+    attest_as: str | None = None
     skills: list[SkillSpec] = Field(min_length=1)
 
     @field_validator("builtin_tools")

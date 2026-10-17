@@ -20,14 +20,26 @@ from a2a.server.tasks import (
     InMemoryPushNotificationConfigStore,
     InMemoryTaskStore,
 )
-from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
+from a2a.types import (
+    AgentCapabilities,
+    AgentCard,
+    AgentInterface,
+    AgentSkill,
+    HTTPAuthSecurityScheme,
+    SecurityRequirement,
+    SecurityScheme,
+    StringList,
+)
 from starlette.applications import Starlette
 
+from agentmesh.access import Access
+from agentmesh.auth import AuthConfig, RequireLogin
 from agentmesh.executor import AgentOSExecutor, Journal, Runner
 from agentmesh.spec import AgentSpec
 
 # How long an agent waits for a webhook to accept one notification.
 PUSH_TIMEOUT = 10.0
+CARD_PATH = "/.well-known/agent-card.json"
 
 
 def is_loopback_url(url: str) -> bool:
@@ -51,7 +63,20 @@ async def loopback_only(url: str) -> bool:
     return is_loopback_url(url)
 
 
-def build_card(spec: AgentSpec) -> AgentCard:
+def build_card(spec: AgentSpec, *, login: bool = False) -> AgentCard:
+    security: dict = {}
+    if login:
+        security = {
+            "security_schemes": {
+                "bearer": SecurityScheme(
+                    http_auth_security_scheme=HTTPAuthSecurityScheme(
+                        scheme="bearer",
+                        description="A principal's token from `agentmesh auth init`",
+                    )
+                )
+            },
+            "security_requirements": [SecurityRequirement(schemes={"bearer": StringList()})],
+        }
     return AgentCard(
         name=spec.name,
         description=spec.description,
@@ -62,6 +87,7 @@ def build_card(spec: AgentSpec) -> AgentCard:
         supported_interfaces=[
             AgentInterface(protocol_binding="JSONRPC", url=spec.url, protocol_version="1.0")
         ],
+        **security,
         skills=[
             AgentSkill(
                 id=s.id,
@@ -83,10 +109,16 @@ def build_app(
     journal: Journal | None = None,
     *,
     push_http: httpx.AsyncClient | None = None,
-) -> Starlette:
+    auth: AuthConfig | None = None,
+) -> Starlette | RequireLogin:
     """``push_http`` is the client notifications are POSTed with (tests pass one that
-    routes in-process); by default the agent makes its own."""
-    card = build_card(spec)
+    routes in-process); by default the agent makes its own.
+
+    With ``auth`` (M5) every JSON-RPC request needs a principal's bearer token, the card
+    says so, and the spec's per-skill access rules apply. Without it, anyone who can reach
+    the port may use every skill, as in M1-M4."""
+    card = build_card(spec, login=auth is not None)
+    access = Access(spec, auth) if auth is not None else None
     push_store = InMemoryPushNotificationConfigStore()
     sender = BasePushNotificationSender(
         push_http or httpx.AsyncClient(timeout=PUSH_TIMEOUT),
@@ -94,11 +126,14 @@ def build_app(
         push_url_validator=loopback_only,
     )
     handler = DefaultRequestHandler(
-        agent_executor=AgentOSExecutor(runner, journal),
+        agent_executor=AgentOSExecutor(runner, journal, access),
         task_store=InMemoryTaskStore(),
         agent_card=card,
         push_config_store=push_store,
         push_sender=sender,
         push_url_validator=loopback_only,
     )
-    return Starlette(routes=[*create_agent_card_routes(card), *create_jsonrpc_routes(handler, "/")])
+    app = Starlette(routes=[*create_agent_card_routes(card), *create_jsonrpc_routes(handler, "/")])
+    if auth is None:
+        return app
+    return RequireLogin(app, auth, public={CARD_PATH})

@@ -63,12 +63,16 @@ def port_free(host: str, port: int) -> bool:
     return True
 
 
-def start(members: list[Member], trace_dir: Path | None = None) -> None:
+def start(
+    members: list[Member], trace_dir: Path | None = None, extra: list[str] | None = None
+) -> None:
+    """``extra`` goes on every ``serve`` command line (the M5 auth options)."""
     for m in members:
         if m.cmd is None:
             m.cmd = [sys.executable, "-m", "agentmesh", "serve", str(m.path)]
             if trace_dir is not None:
                 m.cmd += ["--trace-dir", str(trace_dir / m.path.stem)]
+            m.cmd += extra or []
         launch(m)
 
 

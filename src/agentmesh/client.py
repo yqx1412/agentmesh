@@ -66,6 +66,7 @@ class TaskRun:
     final_message: str = ""
     pushes: int = 0  # notifications received (ask_push only)
     polls: int = 0  # get_task calls made because no notification came (ask_push only)
+    attestation: str = ""  # the agent's signature over its result (M5 signing agents only)
 
     @property
     def state(self) -> str:
@@ -206,6 +207,9 @@ async def cancel(card: AgentCard, task_id: str, http: httpx.AsyncClient) -> str:
 
 
 def _take_artifact(run: TaskRun, artifact) -> None:
+    if artifact.name == "attestation":  # M5: the agent's signature over its result
+        run.attestation = "".join(p.text for p in artifact.parts)
+        return
     if artifact.name == "result":
         run.answer = "".join(p.text for p in artifact.parts)
         raw = MessageToDict(artifact.metadata) if artifact.HasField("metadata") else {}

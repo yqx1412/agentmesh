@@ -26,7 +26,8 @@ orchestrator may use it, and carries the signed results of the steps it depends 
 (``attestations``). The orchestrator logs in with its own token (``orchestrate --as``).
 
 Chained tasks (after M6): every step also receives the user's task (``STEP_CONTEXT``), an
-agent that replies ``CANNOT: <reason>`` has failed its step (so retries and fallback apply),
+agent that replies ``CANNOT: <reason>`` has failed its step (so retries and fallback apply,
+and then the planner is asked once for steps that get the missing input; ``replan_brief``),
 and skills a card tags ``write`` are planned only when the run allows writes.
 """
 
@@ -305,8 +306,18 @@ def plan_schema(skill_ids: list[str]) -> dict[str, Any]:
     }
 
 
-def parse_plan(content: str, catalogue: Catalogue) -> list[Step]:
-    """Check a plan completely: ids, skills, inputs, dependencies, no cycles."""
+def parse_plan(
+    content: str,
+    catalogue: Catalogue,
+    done: frozenset[str] = frozenset(),
+    taken: frozenset[str] = frozenset(),
+    redo: frozenset[str] = frozenset(),
+) -> list[Step]:
+    """Check a plan completely: ids, skills, inputs, dependencies, no cycles.
+
+    For a re-plan, ``taken`` holds every earlier step id (none may be reused), ``done``
+    the ones that completed, which new steps may depend on, and ``redo`` the skills of the
+    steps that replied CANNOT, each of which the new plan must use again."""
     try:
         data = json.loads(content)
     except json.JSONDecodeError as exc:
@@ -326,6 +337,8 @@ def parse_plan(content: str, catalogue: Catalogue) -> list[Step]:
             raise PlanError(f"step {n}: id must be s1, s2, ...; got {sid!r}")
         if any(s.id == sid for s in steps):
             raise PlanError(f"two steps have the id {sid}")
+        if sid in done or sid in taken:
+            raise PlanError(f"{sid} is an earlier step; new steps need new ids")
         skill = str(item.get("skill", "")).strip()
         if skill not in catalogue:
             known = ", ".join(sorted(catalogue))
@@ -344,14 +357,22 @@ def parse_plan(content: str, catalogue: Catalogue) -> list[Step]:
         for d in s.depends_on:
             if d == s.id:
                 raise PlanError(f"step {s.id} depends on itself")
-            if d not in ids:
-                raise PlanError(f"step {s.id} uses {d}, which is not a step in the plan")
-    _check_acyclic(steps)
+            if d not in ids and d not in done:
+                why = "did not complete" if d in taken else "is not a step in the plan"
+                raise PlanError(f"step {s.id} uses {d}, which {why}")
+    _check_acyclic(steps, done)
+    missing = sorted(redo - {s.skill for s in steps})
+    if missing:
+        raise PlanError(
+            "the new steps must redo the work that failed; add a step using "
+            + ", ".join(missing)
+            + " that gets the missing input"
+        )
     return steps
 
 
-def _check_acyclic(steps: list[Step]) -> None:
-    remaining = {s.id: set(s.depends_on) for s in steps}
+def _check_acyclic(steps: list[Step], done: frozenset[str] = frozenset()) -> None:
+    remaining = {s.id: set(s.depends_on) - done for s in steps}
     while remaining:
         ready = [sid for sid, deps in remaining.items() if not deps]
         if not ready:
@@ -363,15 +384,26 @@ def _check_acyclic(steps: list[Step]) -> None:
 
 
 async def make_plan(
-    task: str, cards: list[AgentCard], catalogue: Catalogue, chat: Chat
+    task: str,
+    cards: list[AgentCard],
+    catalogue: Catalogue,
+    chat: Chat,
+    *,
+    earlier: str = "",
+    done: frozenset[str] = frozenset(),
+    taken: frozenset[str] = frozenset(),
+    redo: frozenset[str] = frozenset(),
 ) -> tuple[list[Step], list[dict[str, Any]]]:
-    """A valid plan plus one record per model attempt. Raises PlanError after the last try."""
+    """A valid plan plus one record per model attempt. Raises PlanError after the last try.
+
+    For a re-plan, ``earlier`` describes the steps so far (``replan_brief``), ``taken``
+    holds their ids and ``done`` the completed ones, which the new steps may use."""
     messages = [
         {"role": "system", "content": PLAN_PROMPT},
         {
             "role": "user",
             "content": f"Catalogue:\n{describe_catalogue(cards, catalogue)}\n\n"
-            f"User's task:\n{task}",
+            f"User's task:\n{task}" + (f"\n\n{earlier}" if earlier else ""),
         },
     ]
     schema = plan_schema(sorted(catalogue))
@@ -385,7 +417,7 @@ async def make_plan(
         }
         attempts.append(record)
         try:
-            return parse_plan(reply.content, catalogue), attempts
+            return parse_plan(reply.content, catalogue, done, taken, redo), attempts
         except PlanError as exc:
             record["error"] = str(exc)
             messages += [
@@ -456,6 +488,7 @@ class StepResult:
     attempts: list[Attempt] = field(default_factory=list)
     attestation: str = ""  # this step's signed result, when its agent signs (M5)
     attestations: list[str] = field(default_factory=list)  # forwarded from dependencies
+    cannot: str = ""  # the agent's reason, when an attempt replied CANNOT
 
     @property
     def ok(self) -> bool:
@@ -480,6 +513,7 @@ class StepResult:
             "attempts": [a.to_dict() for a in self.attempts],
             "signed": bool(self.attestation),
             "forwarded_signatures": len(self.attestations),
+            "cannot": self.cannot,
         }
 
 
@@ -509,6 +543,45 @@ def step_input(step: Step, results: dict[str, StepResult], task: str = "") -> st
     return text
 
 
+# Longest earlier result shown to the planner in a re-plan.
+MAX_BRIEF_RESULT = 2000
+
+
+def replan_brief(plan: list[Step], results: dict[str, StepResult]) -> str:
+    """What the planner reads on a re-plan: every step so far with its outcome, and what to
+    write. Completed results stay usable as ``{{sN}}``, so finished work isn't repeated."""
+    context_start = STEP_CONTEXT.split("{task}")[0]
+    lines = []
+    for s in plan:
+        r = results.get(s.id)
+        if r is None:
+            continue
+        asked = (r.input or s.input).split(context_start)[0].strip()
+        if len(asked) > MAX_BRIEF_RESULT:
+            asked = asked[:MAX_BRIEF_RESULT] + " [...]"
+        if r.ok:
+            body = r.answer.strip()
+            if len(body) > MAX_BRIEF_RESULT:
+                body = body[:MAX_BRIEF_RESULT] + " [...]"
+            outcome = f"completed. Result:\n{body}"
+        elif r.cannot:
+            outcome = f"FAILED, the agent replied: CANNOT: {r.cannot}"
+        else:
+            outcome = f"{r.state}: {r.message[:500]}"
+        lines.append(f"### {s.id} ({s.skill}) - {outcome}\nAsked: {asked}")
+    nxt = max((int(sid[1:]) for sid in results), default=0) + 1
+    return (
+        "An earlier plan for this task has already run. At least one step said it could not "
+        "do its part, usually because an input it needs was never asked for.\n\n"
+        + "\n\n".join(lines)
+        + "\n\nWrite a plan of ONLY the new steps that finish the task: first get what the "
+        "failed steps said was missing, then redo those steps and any step skipped because "
+        "of them. Use a completed step's result by writing {{" + "<its id>}} in an input "
+        f"(and listing it in depends_on); do not repeat completed steps. New step ids must "
+        f"start at s{nxt} and continue from there."
+    )
+
+
 @dataclass
 class RunPolicy:
     """How hard a step tries before it fails.
@@ -526,6 +599,9 @@ class RunPolicy:
     fallback: bool = True
     push: PushReceiver | None = None  # follow tasks by push notification instead of a stream
     poll_every: float = 15.0  # push mode: ask the agent if nothing arrived for this long
+    # After the run, a step that failed with CANNOT (a missing input) sends the planner back
+    # once per re-plan to add the steps that get what was missing (``replan_brief``).
+    replans: int = 1
 
 
 @dataclass
@@ -652,6 +728,7 @@ async def _run_one(
                     # though its A2A task completed; without this, M4's retries and
                     # fallback never fire and the next step gets an apology as its input.
                     a.state, a.message = "failed", f"the agent could not do the step: {why}"
+                    r.cannot = why
             r.task_id, r.state, r.message = a.task_id, a.state, a.message
             if a.state == "completed":
                 break
@@ -705,11 +782,15 @@ async def run_steps(
     rec: Recorder,
     policy: RunPolicy | float,
     task: str = "",
+    done: dict[str, StepResult] | None = None,
 ) -> dict[str, StepResult]:
-    """Runs the plan. With ``task`` (the user's task), every step also receives it."""
+    """Runs the plan. With ``task`` (the user's task), every step also receives it.
+
+    ``done`` holds completed steps from an earlier plan (a re-plan): the new steps can
+    depend on them, and they are returned with the new results."""
     if not isinstance(policy, RunPolicy):  # the M3 signature passed a step timeout
         policy = RunPolicy(step_timeout=float(policy))
-    results = {s.id: StepResult(s) for s in plan}
+    results = {**(done or {}), **{s.id: StepResult(s) for s in plan}}
     waiting = {s.id: s for s in plan}
     running: set[asyncio.Task[None]] = set()
     while waiting or running:
@@ -801,6 +882,7 @@ class Orchestration:
     message: str = ""
     trace: Path | None = None
     tokens: dict[str, int] = field(default_factory=lambda: {"prompt": 0, "completion": 0})
+    replans: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -808,6 +890,7 @@ class Orchestration:
             "task": self.task,
             "state": self.state,
             "message": self.message,
+            "replans": self.replans,
             "steps": [self.results[s.id].to_dict() for s in self.plan if s.id in self.results]
             or [s.to_dict() for s in self.plan],
             "answer": self.answer,
@@ -936,6 +1019,57 @@ async def _orchestrate(
         return finish("completed")
 
     out.results = await run_steps(out.plan, catalogue, http, rec, policy, task)
+    model_step = 1
+    for _ in range(max(0, policy.replans)):
+        stuck = [r for r in out.results.values() if r.state == "failed" and r.cannot]
+        if not stuck:
+            break
+        model_step += 1
+        why = "; ".join(f"{r.step.id}: {r.cannot[:200]}" for r in stuck)
+        rec.state("working", message=f"re-planning, because {why}")
+        done = frozenset(sid for sid, r in out.results.items() if r.ok)
+        try:
+            new, attempts = await make_plan(
+                task,
+                cards,
+                catalogue,
+                chat,
+                earlier=replan_brief(out.plan, out.results),
+                done=done,
+                taken=frozenset(out.results),
+                redo=frozenset(r.step.skill for r in stuck),
+            )
+        except PlanError as exc:
+            rec.state("working", message=f"re-plan failed, keeping the first plan: {exc}")
+            break
+        for a in attempts:
+            out.tokens["prompt"] += a["prompt_tokens"]
+            out.tokens["completion"] += a["completion_tokens"]
+        rec.event(
+            "llm_response",
+            step=model_step,
+            content="Re-plan:\n" + json.dumps({"steps": [s.to_dict() for s in new]}, indent=2),
+            tool_calls=[
+                {
+                    "name": f"{s.id} {s.skill} -> {catalogue[s.skill][0].agent}",
+                    "arguments": {"input": s.input, "depends_on": s.depends_on},
+                }
+                for s in new
+            ],
+            prompt_tokens=sum(a["prompt_tokens"] for a in attempts),
+            completion_tokens=sum(a["completion_tokens"] for a in attempts),
+        )
+        # The new steps take over from every step that didn't complete.
+        for r in out.results.values():
+            if not r.ok:
+                r.message = f"{r.state}, replaced by a re-plan: {r.message}"
+                r.state = "replaced"
+        out.replans += 1
+        rec.state("working", message="re-plan: " + "; ".join(f"{s.id} {s.skill}" for s in new))
+        out.plan = [*out.plan, *new]
+        kept = {sid: r for sid, r in out.results.items() if r.ok}
+        out.results.update(await run_steps(new, catalogue, http, rec, policy, task, done=kept))
+
     rec.state("working", message="combining the results")
     try:
         reply = await combine(task, out.plan, out.results, chat, writes_off)
@@ -946,13 +1080,13 @@ async def _orchestrate(
     out.tokens["completion"] += reply.completion_tokens
     rec.event(
         "llm_response",
-        step=2,
+        step=model_step + 1,
         content=out.answer,
         tool_calls=[],
         prompt_tokens=reply.prompt_tokens,
         completion_tokens=reply.completion_tokens,
     )
-    bad = [r for r in out.results.values() if not r.ok]
+    bad = [r for r in out.results.values() if not r.ok and r.state != "replaced"]
     if bad:
         listed = ", ".join(f"{r.step.id} {r.state}" for r in bad)
         return finish("failed", f"not every step completed: {listed}", stop="step_failed")

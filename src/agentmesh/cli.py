@@ -111,6 +111,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Follow steps by push notification (a webhook on 127.0.0.1) instead of a stream",
     )
     orch.add_argument(
+        "--replans",
+        type=int,
+        default=1,
+        help="Times to re-plan when a step replies CANNOT (a missing input); 0 turns it off "
+        "(default: 1)",
+    )
+    orch.add_argument(
         "--allow-writes",
         action="store_true",
         help="Let the plan use skills a card tags 'write' (storing to the knowledge base). "
@@ -447,6 +454,7 @@ async def _orchestrate(args: argparse.Namespace) -> int:
         retries=args.retries,
         fallback=not args.no_fallback,
         push=receiver,
+        replans=args.replans,
     )
     try:
         async with httpx.AsyncClient(

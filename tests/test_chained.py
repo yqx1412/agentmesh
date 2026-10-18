@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 from test_m3 import Fleet, ScriptedChat, answers, plan, step
 
+from agentmesh.executor import RunOutcome
 from agentmesh.orchestrator import (
     STEP_CONTEXT,
     RunPolicy,
@@ -120,7 +121,8 @@ async def test_cannot_skips_the_steps_that_need_it(tmp_path):
         ),
         "Could not compute: the context length is missing.",
     )
-    out = await orchestrate("t", await cards_of(fleet), chat, fleet.http, policy=NO_WAIT)
+    no_replan = RunPolicy(retries=1, backoff=0, replans=0)
+    out = await orchestrate("t", await cards_of(fleet), chat, fleet.http, policy=no_replan)
     assert out.state == "failed"
     assert out.results["s2"].state == "failed" and out.results["s2"].answer == ""
     assert "the context length is missing" in out.results["s2"].message
@@ -195,3 +197,101 @@ async def test_allow_writes_offers_them(with_writer):
     assert out.state == "completed", out.message
     assert with_writer.received["Knowledge"][0].startswith("Store 1. Claim A")
     assert "Writing was not enabled" not in chat.calls[1][0][-1]["content"]
+
+
+# --- 4. re-plan when a step says an input is missing -----------------------------------
+
+
+def research(task, progress, flag):
+    progress("step 1: searching")
+    text = "native context 32768 tokens" if "context length" in task else "layers 36, KV heads 8"
+    return RunOutcome(answer=text, stop_reason="final_answer", steps=1)
+
+
+def analyst(task, progress, flag):
+    progress("step 1: computing")
+    if "32768" not in task.split("\n---\n")[0]:
+        return RunOutcome(answer="CANNOT: missing context length", stop_reason="final_answer")
+    return RunOutcome(answer="4.5 GiB", stop_reason="final_answer", steps=1)
+
+
+KV_PLAN = plan(
+    step("s1", "web_research", "Find the layers and KV heads."),
+    step("s2", "calculate", "KV cache from {{s1}}", ["s1"]),
+)
+KV_REPLAN = plan(
+    step("s3", "web_research", "Find the native context length."),
+    step("s4", "calculate", "KV cache from {{s1}} at {{s3}}", ["s1", "s3"]),
+)
+
+
+@pytest.fixture
+def kv(tmp_path):
+    return Fleet(
+        tmp_path,
+        {"Research": (9001, "web_research", research), "Analyst": (9002, "calculate", analyst)},
+    )
+
+
+async def test_cannot_triggers_a_replan_that_reuses_finished_work(kv):
+    chat = ScriptedChat(KV_PLAN, KV_REPLAN, "4.5 GiB")
+    out = await orchestrate("KV cache?", await cards_of(kv), chat, kv.http, policy=NO_WAIT)
+    assert out.state == "completed", out.message
+    assert out.replans == 1
+    assert [s.id for s in out.plan] == ["s1", "s2", "s3", "s4"]
+    assert out.results["s2"].state == "replaced"
+    assert out.results["s4"].answer == "4.5 GiB"
+    # s1 ran once; the re-plan used its result instead of repeating it.
+    assert [t.split("\n---\n")[0].strip() for t in kv.received["Research"]] == [
+        "Find the layers and KV heads.",
+        "Find the native context length.",
+    ]
+    assert kv.received["Analyst"][-1].startswith(
+        "KV cache from layers 36, KV heads 8 at native context 32768 tokens"
+    )
+    brief = chat.calls[1][0][1]["content"]
+    assert "s2 (calculate) - FAILED, the agent replied: CANNOT: missing context length" in brief
+    assert "s1 (web_research) - completed. Result:\nlayers 36, KV heads 8" in brief
+    assert "start at s3" in brief
+    assert out.to_dict()["replans"] == 1
+
+
+async def test_a_replan_may_not_reuse_or_depend_on_unfinished_steps(kv):
+    bad = plan(step("s2", "calculate", "again {{s1}}", ["s1"]))
+    worse = plan(step("s3", "calculate", "with {{s2}}", ["s2"]))
+    chat = ScriptedChat(KV_PLAN, bad, worse, KV_REPLAN, "4.5 GiB")
+    out = await orchestrate("KV cache?", await cards_of(kv), chat, kv.http, policy=NO_WAIT)
+    assert out.state == "completed", out.message
+    # make_plan sends one growing conversation; the re-plan's is the last one recorded.
+    said = [m["content"] for m in chat.calls[3][0] if m["role"] == "user"]
+    assert any("s2 is an earlier step; new steps need new ids" in m for m in said)
+    assert any("uses s2, which did not complete" in m for m in said)
+
+
+async def test_a_replan_must_redo_the_failed_skill(kv):
+    # Live, a re-plan once only fetched the missing value; the combiner then did the
+    # arithmetic itself, wrongly. Such a plan is now sent back.
+    fetch_only = plan(step("s3", "web_research", "Find the native context length."))
+    chat = ScriptedChat(KV_PLAN, fetch_only, KV_REPLAN, "4.5 GiB")
+    out = await orchestrate("KV cache?", await cards_of(kv), chat, kv.http, policy=NO_WAIT)
+    assert out.state == "completed", out.message
+    said = [m["content"] for m in chat.calls[2][0] if m["role"] == "user"]
+    assert any("must redo the work that failed; add a step using calculate" in m for m in said)
+    assert out.results["s4"].answer == "4.5 GiB"
+
+
+async def test_replans_are_bounded(kv):
+    still_missing = plan(step("s3", "calculate", "KV cache from {{s1}}", ["s1"]))
+    chat = ScriptedChat(KV_PLAN, still_missing, "Could not compute it.")
+    out = await orchestrate("KV cache?", await cards_of(kv), chat, kv.http, policy=NO_WAIT)
+    assert out.state == "failed" and out.replans == 1
+    assert out.results["s3"].state == "failed" and out.results["s3"].cannot
+    assert len(chat.calls) == 3  # plan, one re-plan, combine
+
+
+async def test_other_failures_do_not_replan(tmp_path):
+    fleet = Fleet(tmp_path, {"Research": (9001, "web_research", answers("half", stop="max_steps"))})
+    chat = ScriptedChat(plan(step("s1", "web_research", "x")), "nothing")
+    out = await orchestrate("t", await cards_of(fleet), chat, fleet.http, policy=NO_WAIT)
+    assert out.state == "failed" and out.replans == 0
+    assert len(chat.calls) == 2

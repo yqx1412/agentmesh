@@ -1,0 +1,168 @@
+# M6 task set: the same prompts go to the single agent (agents/solo.toml) and to the fleet
+# through the orchestrator. Checks are deterministic and look only at the final answer.
+# Ground truth was checked by hand on 2026-10-17 against:
+#   Qwen3-8B model card + config.json (Apache-2.0, 32,768 native, 36 layers, 8 KV heads, 128)
+#   github.com/a2aproject/A2A README ("under the Linux Foundation, contributed by Google")
+#   docs.ollama.com/faq ("binds 127.0.0.1 port 11434", "context window size of 4096 tokens")
+#   modelcontextprotocol.io intro ("open-source standard...", "like a USB-C port")
+#   llama.cpp docs/speculative.md ("--spec-draft-model, -md, --model-draft")
+#   DomainGraph chunks: L7 [39] 45:27 "Excel spreadsheet approach", L1 [28] 35:06 "13 seconds
+#   ... 0.001 seconds", L9 [16] 19:28 "constant amortized per insert".
+# cites: true marks tasks whose answer must cite web pages; URLs it cites are compared with
+# the pages the system actually fetched (from the agents' traces).
+tasks:
+  # --- research: one web lookup ---------------------------------------------------------
+  - id: r-qwen-license
+    category: research
+    cites: true
+    prompt: >-
+      What license is the Qwen3-8B model released under, and what is its native context
+      length in tokens? Cite the pages you used.
+    checks:
+      - {type: answer_contains, values: [apache]}
+      - {type: answer_regex, pattern: '32[,. ]?768|32\s?k\b'}
+
+  - id: r-a2a-origin
+    category: research
+    cites: true
+    prompt: >-
+      Which company contributed the Agent2Agent (A2A) protocol, and which foundation hosts
+      the project now? Cite your sources.
+    checks:
+      - {type: answer_contains, values: [google, linux foundation]}
+
+  - id: r-ollama-port
+    category: research
+    cites: true
+    prompt: >-
+      On which address and port does the Ollama server listen by default? Cite the
+      documentation.
+    checks:
+      - {type: answer_number, value: 11434}
+      - {type: answer_contains, values: [127.0.0.1]}
+
+  - id: r-llama-draft
+    category: research
+    cites: true
+    prompt: >-
+      In llama.cpp's llama-server, which command-line option sets the draft model for
+      speculative decoding? Cite the documentation.
+    checks:
+      - {type: answer_regex, pattern: '(?<![\w-])-md\b|--model-draft|--spec-draft-model'}
+
+  - id: r-mcp-definition
+    category: research
+    cites: true
+    prompt: >-
+      What does MCP stand for in the context of AI applications, and what everyday device
+      does its official documentation compare it to? Cite the page.
+    checks:
+      - {type: answer_contains, values: [model context protocol]}
+      - {type: answer_regex, pattern: 'usb[- ]?c'}
+
+  # --- analysis: computation from numbers given in the task -----------------------------
+  - id: a-kv-cache
+    category: analysis
+    prompt: >-
+      A transformer has 48 layers, 8 KV heads and a head dimension of 128, and stores its KV
+      cache in fp16. How many GiB does the KV cache take for 8,192 tokens?
+    checks:
+      - {type: answer_number, value: 1.5, tol: 0.011}
+
+  - id: a-weights
+    category: analysis
+    prompt: >-
+      A 14.7-billion-parameter model is quantized to 4.5 bits per weight. How many GiB do
+      its weights take (1 GiB = 2^30 bytes)? Round to two decimals.
+    checks:
+      - {type: answer_number, value: 7.70, tol: 0.011}
+
+  - id: a-latency-stats
+    category: analysis
+    prompt: >-
+      These are request latencies in milliseconds: 212, 198, 305, 187, 240, 199, 410. What
+      are their mean and median? Round to two decimals.
+    checks:
+      - {type: answer_number, value: 250.14, tol: 0.011}
+      - {type: answer_regex, pattern: 'median[^0-9]{0,40}212(\.0+)?\b'}
+
+  - id: a-throughput
+    category: analysis
+    prompt: >-
+      A local model decodes 42 tokens/s and spends 2.1 s on prompt processing per request.
+      How many seconds do 3 requests take one after another if each generates 750 tokens?
+      Round to one decimal.
+    checks:
+      - {type: answer_number, value: 59.9, tol: 0.051}
+
+  # --- knowledge: the user's lecture notes in DomainGraph -------------------------------
+  - id: k-radix-analogy
+    category: knowledge
+    prompt: >-
+      In my lecture notes from MIT 6.006 Lecture 7, what everyday software does the lecturer
+      compare radix sort's column-by-column approach to? Cite the lecture timestamp.
+    checks:
+      - {type: answer_regex, pattern: 'excel|spreadsheet'}
+      - {type: answer_timestamp, start: '44:00', end: '49:30'}
+
+  - id: k-peak-timing
+    category: knowledge
+    prompt: >-
+      According to my notes from MIT 6.006 Lecture 1, how long did the lecturer say the
+      Θ(n) and the Θ(log n) peak-finding algorithms took for n of about 10 million?
+    checks:
+      - {type: answer_number, value: 13}
+      - {type: answer_number, value: 0.001}
+
+  - id: k-table-doubling
+    category: knowledge
+    prompt: >-
+      In my MIT 6.006 Lecture 9 notes, what amortized cost per insertion does table doubling
+      give? Cite the lecture timestamp where the lecturer says it.
+    checks:
+      - {type: answer_regex, pattern: 'constant|O\(1\)|Θ\(1\)|theta\s*\(?1\)?'}
+      - {type: answer_timestamp, start: '18:30', end: '22:00'}
+
+  # --- verification: claims with cited sources, one of them false ------------------------
+  - id: v-three-claims
+    category: verification
+    prompt: |-
+      Check each claim against the page cited for it:
+      1. Ollama binds 127.0.0.1 port 11434 by default [https://docs.ollama.com/faq]
+      2. The A2A protocol was contributed to the Linux Foundation by Anthropic [https://github.com/a2aproject/A2A]
+      3. MCP is an open-source standard for connecting AI applications to external systems [https://modelcontextprotocol.io/docs/getting-started/intro]
+      End your reply with one line "FALSE: <numbers>" listing the claims their source contradicts or does not support.
+    checks:
+      - {type: answer_regex, pattern: 'FALSE:\s*\[?\s*(claim\s*)?2\s*\]?\s*\.?\s*$'}
+
+  # --- composite: needs two kinds of work chained -------------------------------------------
+  - id: c-qwen-kv
+    category: composite
+    cites: true
+    prompt: >-
+      Look up Qwen3-8B's number of layers, number of KV heads and head dimension in its
+      official model card or config, then compute its fp16 KV-cache size in GiB at its full
+      native context length.
+    checks:
+      - {type: answer_number, value: 36}
+      - {type: answer_number, value: 4.5, tol: 0.011}
+
+  - id: c-ollama-ratio
+    category: composite
+    cites: true
+    prompt: >-
+      Find Ollama's default context window size in tokens in its documentation and Qwen3-8B's
+      native context length in its model card. How many of Ollama's default windows fit in
+      Qwen3-8B's native context? End with one line "RATIO: <number>".
+    checks:
+      - {type: answer_number, value: 4096}
+      - {type: answer_regex, pattern: 'RATIO:\s*8(\.0+)?\s*$'}
+
+  - id: c-peak-speedup
+    category: composite
+    prompt: >-
+      Find in my MIT 6.006 Lecture 1 notes how long the Θ(n) and the Θ(log n) peak-finding
+      algorithms took for n of about 10 million, then compute how many times faster the
+      Θ(log n) one was.
+    checks:
+      - {type: answer_number, value: 13000}

@@ -1,0 +1,37 @@
+# M6 single-agent baseline: ONE AgentOS agent with the union of the four specialists' tools
+# (web search + fetch, sandboxed Python + calculator, DomainGraph lookups), compared against
+# the whole fleet by `agentmesh eval`. Not part of `agentmesh up`'s default fleet.
+# It has no add_fact: no M6 task asks for a write. (The fleet's planner can still add a
+# knowledge_write step on its own, and in the M6 run it did; see the write-up.)
+# `uv run agentmesh serve agents/solo.toml --trace-dir runs/fleet-traces/solo`
+name = "Solo Agent"
+description = "A single generalist agent: researches the web with citations, computes numbers with a sandboxed Python and answers from the DomainGraph lecture notes."
+version = "0.6.0"
+port = 9115
+# The fleet's strongest settings (Analyst / Verifier / orchestrator model, reasoning on).
+model = "qwen3:14b"
+kind = "plain"
+# Roughly the budget of the longest specialist chain (Research 16 + Analyst 14).
+max_steps = 30
+allow = "dangerous"
+builtin_tools = ["calculator", "run_python"]
+think = true
+# The same quote check the Verifier has; it only bites when the answer quotes something.
+check_quotes = true
+workspace = "../workspace/solo"
+agentos_config = "solo.agentos.toml"
+instructions = """\
+You are a single agent that does every part of a task yourself.
+- Web facts: web_search, then fetch_url on the 2-4 most relevant results. Search snippets are not sources. Cite only pages you fetched, next to the claims they support, as [url].
+- Checking claims against cited sources: fetch each cited URL and judge only from the fetched text, never from your own knowledge.
+- Numbers: compute every figure in one run_python script that assigns each given quantity to a variable and print()s every result with its unit. Report only printed values. A transformer's KV cache stores both a key and a value per token: 2 x layers x kv_heads x head_dim x bytes per element x tokens.
+- The user's lecture notes are in the DomainGraph knowledge base: use search with k = 5 (and get_concept or related_concepts for a named concept). If the question names a lecture, use only results from that lecture. Cite the lecture title and timestamps.
+- Do every part of the task, then lead your reply with the answer."""
+
+[[skills]]
+id = "general"
+name = "General task"
+description = "Does the whole task alone: web research with citations, exact computation, claim checking and lecture-note lookups."
+tags = ["research", "analysis", "verification", "knowledge"]
+examples = ["Find Qwen3-8B's layer count from its model card and compute its KV-cache size at 32k tokens"]
+callers = ["user"]

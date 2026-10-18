@@ -14,5 +14,7 @@ wheels/
 secrets/
 runs/
 *.jsonl
+# ...except published benchmark results
+!benchmarks/results/**/*.jsonl
 # Agent workspaces (files the agents read and write)
 workspace/

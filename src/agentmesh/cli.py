@@ -1,5 +1,5 @@
 """``agentmesh serve <spec> | up | watch | card <url> | ask <url> <task> | orchestrate <task> |
-auth init``."""
+auth init | eval run | eval report <dir>``."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -128,6 +129,52 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"An agent that signs results; repeat it (default: {', '.join(DEFAULT_SIGNERS)})",
     )
     init.add_argument("--force", action="store_true", help="Replace existing tokens and keys")
+
+    ev = sub.add_parser("eval", help="M6: the same tasks on one agent and on the whole fleet")
+    ev_sub = ev.add_subparsers(dest="eval_command")
+    run = ev_sub.add_parser("run", help="Run the task set; re-running into --out resumes")
+    run.add_argument(
+        "--tasks",
+        type=Path,
+        default=Path("benchmarks") / "m6" / "tasks.yaml",
+        help="Default: benchmarks/m6/tasks.yaml",
+    )
+    run.add_argument("--out", type=Path, help="Results folder (default: runs/m6/<time>)")
+    run.add_argument("--repeats", type=int, default=1, help="Runs per task and system")
+    run.add_argument(
+        "--system",
+        dest="systems",
+        action="append",
+        choices=["single", "multi"],
+        help="Repeat it (default: both)",
+    )
+    run.add_argument("--only", action="append", help="Task id or category glob; repeat it")
+    run.add_argument("--solo", default="http://127.0.0.1:9115", help="The single agent's URL")
+    run.add_argument("--solo-skill", default="general")
+    run.add_argument(
+        "--agent",
+        dest="agents",
+        action="append",
+        metavar="URL",
+        help="A fleet agent's URL; repeat it. Default: the URLs in the fleet's specs",
+    )
+    run.add_argument("--agents-dir", type=Path, default=Path("agents"), help="Default: agents")
+    run.add_argument("--model", default="qwen3:14b", help="Planner model (default: qwen3:14b)")
+    run.add_argument("--ollama-url", default="http://127.0.0.1:11434")
+    run.add_argument(
+        "--trace-root",
+        type=Path,
+        default=Path("runs") / "fleet-traces",
+        help="Where every agent (solo included) writes traces (default: runs/fleet-traces)",
+    )
+    run.add_argument(
+        "--timeout", type=float, default=1800.0, help="Seconds per run (default: 1800)"
+    )
+    run.add_argument("--step-timeout", type=float, default=900.0, help="multi: seconds per attempt")
+    run.add_argument("--auth-dir", type=Path, default=DEFAULT_DIR, help="Default: secrets")
+    rep = ev_sub.add_parser("report", help="Markdown tables from a results folder")
+    rep.add_argument("out", type=Path, help="A folder written by `eval run`")
+    rep.add_argument("--tasks", type=Path, default=Path("benchmarks") / "m6" / "tasks.yaml")
     return p
 
 
@@ -179,6 +226,10 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_orchestrate(args))
     if args.command == "auth" and args.auth_command == "init":
         return _auth_init(args)
+    if args.command == "eval" and args.eval_command == "run":
+        return asyncio.run(_eval_run(args))
+    if args.command == "eval" and args.eval_command == "report":
+        return _eval_report(args)
     build_parser().print_help()
     return 0
 
@@ -426,3 +477,117 @@ async def _orchestrate(args: argparse.Namespace) -> int:
     if out.trace:
         print(f"trace: {out.trace}", file=sys.stderr)
     return 0 if out.state == "completed" else 3
+
+
+async def _eval_run(args: argparse.Namespace) -> int:
+    from agentmesh.auth import AuthError, auth_headers
+    from agentmesh.evaluate import (
+        EvalError,
+        load_tasks,
+        report,
+        run_eval,
+        run_multi,
+        run_single,
+        select_tasks,
+    )
+    from agentmesh.orchestrator import OllamaChat, RunPolicy, discover_all
+
+    try:
+        tasks = select_tasks(load_tasks(args.tasks), args.only)
+    except EvalError as exc:
+        print(f"eval error: {exc}", file=sys.stderr)
+        return 2
+    if not tasks:
+        print("eval error: no task matches --only", file=sys.stderr)
+        return 2
+    systems = args.systems or ["single", "multi"]
+    try:
+        user = auth_headers(args.auth_dir, "user")
+        orch = auth_headers(args.auth_dir, "orchestrator")
+    except AuthError as exc:
+        print(f"auth error: {exc}", file=sys.stderr)
+        return 2
+    out_dir = args.out or Path("runs") / "m6" / time.strftime("%Y%m%d-%H%M%S")
+    urls = args.agents or _fleet_urls(args.agents_dir)
+    chat = OllamaChat(args.model, args.ollama_url)
+    policy = RunPolicy(step_timeout=args.step_timeout)
+    async with (
+        httpx.AsyncClient(timeout=args.timeout, headers=user) as user_http,
+        httpx.AsyncClient(timeout=args.timeout, headers=orch) as orch_http,
+    ):
+        solo = fleet_cards = None
+        if "single" in systems:
+            from agentmesh.client import discover
+
+            solo = await discover(args.solo, user_http)
+            print(f"single: {solo.name} at {args.solo}", file=sys.stderr)
+        if "multi" in systems:
+            fleet_cards, errors = await discover_all(urls, orch_http)
+            for e in errors:
+                print(f"no card: {e}", file=sys.stderr)
+            print(f"multi: {', '.join(c.name for c in fleet_cards)}", file=sys.stderr)
+            if not fleet_cards:
+                return 2
+
+        async def run_one(task, system):
+            if system == "single":
+                return await run_single(
+                    task, solo, user_http, skill=args.solo_skill, timeout=args.timeout
+                )
+            return await run_multi(
+                task,
+                fleet_cards,
+                chat,
+                orch_http,
+                trace_root=args.trace_root,
+                policy=policy,
+                timeout=args.timeout,
+                model_name=args.model,
+            )
+
+        def progress(rec, n, total) -> None:
+            mark = "PASS" if rec.passed else f"FAIL {rec.failure}"
+            print(
+                f"[{n}/{total}] {rec.system:6} {rec.task_id} r{rec.repeat}: {mark} "
+                f"{rec.seconds:.0f} s, {rec.tokens:,} tokens",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        print(f"results: {out_dir}", file=sys.stderr, flush=True)
+        await run_eval(
+            tasks,
+            systems,
+            repeats=args.repeats,
+            out_dir=out_dir,
+            run_one=run_one,
+            trace_root=args.trace_root,
+            meta={
+                "solo": args.solo,
+                "fleet": urls,
+                "planner": args.model,
+                "timeout": args.timeout,
+                "step_timeout": args.step_timeout,
+                "task_file": str(args.tasks),
+            },
+            progress=progress,
+        )
+    from agentmesh.evaluate import load_results
+
+    text = report(load_results(out_dir / "results.jsonl"), tasks)
+    (out_dir / "report.md").write_text(text, encoding="utf-8")
+    print(text)
+    return 0
+
+
+def _eval_report(args: argparse.Namespace) -> int:
+    from agentmesh.evaluate import EvalError, load_results, load_tasks, report
+
+    try:
+        tasks = load_tasks(args.tasks)
+    except EvalError:
+        tasks = None
+    text = report(load_results(args.out / "results.jsonl"), tasks)
+    (args.out / "report.md").write_text(text, encoding="utf-8")
+    print(text)
+    return 0

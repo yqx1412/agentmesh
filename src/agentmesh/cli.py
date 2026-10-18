@@ -110,6 +110,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Follow steps by push notification (a webhook on 127.0.0.1) instead of a stream",
     )
+    orch.add_argument(
+        "--allow-writes",
+        action="store_true",
+        help="Let the plan use skills a card tags 'write' (storing to the knowledge base). "
+        "Off by default, so a question never changes anything",
+    )
     _client_auth_args(orch, "orchestrator")
 
     auth = sub.add_parser("auth", help="Logins between agents (M5)")
@@ -461,6 +467,7 @@ async def _orchestrate(args: argparse.Namespace) -> int:
                 plan_only=args.plan_only,
                 on_line=lambda line: print(f"  {line}", file=sys.stderr, flush=True),
                 model_name=args.model,
+                allow_writes=args.allow_writes,
             )
     finally:
         if receiver is not None:

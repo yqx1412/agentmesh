@@ -24,6 +24,10 @@ a held-open stream.
 Security (M5): every delegated message names the skill it wants, so the agent can check the
 orchestrator may use it, and carries the signed results of the steps it depends on
 (``attestations``). The orchestrator logs in with its own token (``orchestrate --as``).
+
+Chained tasks (after M6): every step also receives the user's task (``STEP_CONTEXT``), an
+agent that replies ``CANNOT: <reason>`` has failed its step (so retries and fallback apply),
+and skills a card tags ``write`` are planned only when the run allows writes.
 """
 
 from __future__ import annotations
@@ -59,9 +63,13 @@ the user's task into steps and give each step to one skill from the catalogue.
 Rules:
 - Use only skills from the catalogue, by id. Choose each one by what its description says \
 it does, and respect what each agent's description says it cannot do.
-- A step's "input" is the entire message that agent receives. The agent sees nothing else: \
-not the user's task and not the other steps. Make it complete and self-contained, and say \
+- A step's "input" is the message that agent receives. It also gets the user's task, for \
+context only, but never the other steps. Make the input complete and self-contained, and say \
 what the agent should return.
+- When a later step computes something, the step that gathers its inputs must ask for every \
+value that computation needs.
+- Ask each step for exactly what the user's task asks, in the same direction: "A per B" \
+stays "A per B", never "B per A".
 - To give a step an earlier step's result, write {{<step id>}} in its input, for example \
 "Check each of these claims against its cited source: {{s1}}". It is replaced by that \
 step's full answer, and the step then runs after it.
@@ -77,11 +85,48 @@ Reply with JSON only: {"steps": [{"id": "s1", "skill": "<skill id>", "input": ".
 COMBINE_PROMPT = """\
 You write the final reply to a user's task from the results of a team of AI agents.
 - Use only what the results say. Do not add facts of your own.
-- Lead with the answer to the task. Keep sources (URLs, lecture timestamps) next to the \
-claims they support.
+- Lead with the answer to the task exactly as it was asked. If steps answer different \
+questions (for example a ratio and its inverse), use the one that matches the task.
+- Keep sources (URLs, lecture timestamps) next to the claims they support.
 - Say which steps failed or were skipped, and what that leaves undone.
 - Say that something was stored in the knowledge base only if a result says it was \
 stored, and list what was stored."""
+
+# Appended to every step's input (see ``step_input``): the user's task, so a step isn't
+# limited to the planner's rewording of it, and a way to fail instead of "completing" with
+# an apology, so retries and fallback apply.
+STEP_CONTEXT = """\
+
+
+---
+This is one step of a larger task. The user's whole task, for context only (do just your \
+step; other agents do the rest):
+{task}
+
+If you cannot do your step (an input it needs is missing, or a tool or service failed and \
+you could not get around it), reply with one line instead of an answer:
+CANNOT: <what is missing or what failed>"""
+
+# A reply line an agent uses to say it couldn't do its step (markdown emphasis allowed).
+_CANNOT = re.compile(r"^[ \t>*_`-]*CANNOT[ \t]*:[ \t*_`]*(.*?)[ \t*_`]*$", re.MULTILINE)
+
+# Card skills carrying this tag change state (the Knowledge agent's knowledge_write). The
+# planner only sees them when the run allows writes (``orchestrate(allow_writes=True)``).
+WRITE_TAG = "write"
+
+WRITES_OFF = (
+    "Writing was not enabled for this run, so no step could store anything (skills not "
+    "offered to the planner: {skills}). If the task asked to store or update something, "
+    "say it was not done and that it needs `agentmesh orchestrate --allow-writes`."
+)
+
+
+def cannot_reason(answer: str) -> str | None:
+    """The reason when the answer says the agent couldn't do its step, else None."""
+    m = _CANNOT.search(answer)
+    if m is None:
+        return None
+    return m.group(1).strip() or "no reason given"
 
 
 # --- the model -------------------------------------------------------------------------
@@ -150,6 +195,11 @@ class Skill:
     agent: str
     card: AgentCard
     examples: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+
+    @property
+    def writes(self) -> bool:
+        return WRITE_TAG in self.tags
 
 
 Catalogue = dict[str, list[Skill]]
@@ -178,17 +228,27 @@ def build_catalogue(cards: list[AgentCard]) -> Catalogue:
     for card in cards:
         for s in card.skills:
             cat.setdefault(s.id, []).append(
-                Skill(s.id, s.name, s.description, card.name, card, list(s.examples))
+                Skill(s.id, s.name, s.description, card.name, card, list(s.examples), list(s.tags))
             )
     return cat
 
 
-def describe_catalogue(cards: list[AgentCard]) -> str:
-    """The catalogue as the planner reads it: each agent's description, then its skills."""
+def without_writes(catalogue: Catalogue) -> tuple[Catalogue, list[str]]:
+    """The catalogue minus every skill some card tags ``write``, and those skills' ids."""
+    removed = sorted(sid for sid, skills in catalogue.items() if any(s.writes for s in skills))
+    return {k: v for k, v in catalogue.items() if k not in removed}, removed
+
+
+def describe_catalogue(cards: list[AgentCard], only: Catalogue | None = None) -> str:
+    """The catalogue as the planner reads it: each agent's description, then its skills
+    (only those in ``only``, when given; an agent left with none is not listed)."""
     lines = []
     for card in cards:
+        skills = [s for s in card.skills if only is None or s.id in only]
+        if not skills:
+            continue
         lines.append(f"Agent: {card.name}. {card.description}")
-        for s in card.skills:
+        for s in skills:
             ex = f' Example: "{s.examples[0]}"' if s.examples else ""
             lines.append(f"  - skill `{s.id}`: {s.description}{ex}")
     return "\n".join(lines)
@@ -310,7 +370,8 @@ async def make_plan(
         {"role": "system", "content": PLAN_PROMPT},
         {
             "role": "user",
-            "content": f"Catalogue:\n{describe_catalogue(cards)}\n\nUser's task:\n{task}",
+            "content": f"Catalogue:\n{describe_catalogue(cards, catalogue)}\n\n"
+            f"User's task:\n{task}",
         },
     ]
     schema = plan_schema(sorted(catalogue))
@@ -427,18 +488,24 @@ def fill(text: str, results: dict[str, StepResult]) -> str:
     return _REF.sub(lambda m: results[m.group(1)].answer.strip(), text)
 
 
-def step_input(step: Step, results: dict[str, StepResult]) -> str:
+def step_input(step: Step, results: dict[str, StepResult], task: str = "") -> str:
     """The message a step's agent receives.
 
     The planner often lists a dependency in ``depends_on`` but never writes ``{{sN}}`` into
     the input ("Verify the claims from the research"), which would send the agent a request
     about data it never sees. Any dependency the input doesn't reference is appended.
+
+    With ``task``, the user's own task is appended too (``STEP_CONTEXT``): in M6 every
+    chained-task failure came from a step seeing only the planner's rewording, which had
+    dropped an input or flipped a ratio. It also tells the agent how to fail (``CANNOT:``).
     """
     text = fill(step.input, results)
     used = set(_REF.findall(step.input))
     for dep in step.depends_on:
         if dep not in used:
             text += f"\n\nResult of step {dep}:\n{results[dep].answer.strip()}"
+    if task.strip():
+        text += STEP_CONTEXT.format(task=task.strip())
     return text
 
 
@@ -549,11 +616,12 @@ async def _run_one(
     http: httpx.AsyncClient,
     rec: Recorder,
     policy: RunPolicy,
+    task: str = "",
 ) -> None:
     """Runs one step to a terminal state. Never raises (except when cancelled): failures,
     retries and fallbacks go into the result."""
     r = results[step.id]
-    r.input = step_input(step, results)
+    r.input = step_input(step, results, task)
     # M5: hand on every signed result this step depends on (the Knowledge agent only
     # writes what the Verifier signed). The orchestrator can relay them but not make one.
     r.attestations = [results[d].attestation for d in step.depends_on if results[d].attestation]
@@ -579,6 +647,11 @@ async def _run_one(
                 r.attestation = run.attestation
                 if a.state == "completed" and not run.answer.strip():
                     a.state, a.message = "failed", "the agent completed with an empty answer"
+                elif a.state == "completed" and (why := cannot_reason(run.answer)):
+                    # An agent that says it couldn't do its part has failed the step, even
+                    # though its A2A task completed; without this, M4's retries and
+                    # fallback never fire and the next step gets an apology as its input.
+                    a.state, a.message = "failed", f"the agent could not do the step: {why}"
             r.task_id, r.state, r.message = a.task_id, a.state, a.message
             if a.state == "completed":
                 break
@@ -631,7 +704,9 @@ async def run_steps(
     http: httpx.AsyncClient,
     rec: Recorder,
     policy: RunPolicy | float,
+    task: str = "",
 ) -> dict[str, StepResult]:
+    """Runs the plan. With ``task`` (the user's task), every step also receives it."""
     if not isinstance(policy, RunPolicy):  # the M3 signature passed a step timeout
         policy = RunPolicy(step_timeout=float(policy))
     results = {s.id: StepResult(s) for s in plan}
@@ -661,7 +736,9 @@ async def run_steps(
                 elif all(d.ok for d in deps):
                     del waiting[sid]
                     running.add(
-                        asyncio.ensure_future(_run_one(s, results, catalogue, http, rec, policy))
+                        asyncio.ensure_future(
+                            _run_one(s, results, catalogue, http, rec, policy, task)
+                        )
                     )
         if not running:
             break
@@ -683,23 +760,30 @@ async def run_steps(
 
 
 async def combine(
-    task: str, plan: list[Step], results: dict[str, StepResult], chat: Chat
+    task: str,
+    plan: list[Step],
+    results: dict[str, StepResult],
+    chat: Chat,
+    writes_off: list[str] | None = None,
 ) -> ChatReply:
+    context_start = STEP_CONTEXT.split("{task}")[0]
     parts = []
     for s in plan:
         r = results[s.id]
         body = r.answer if r.ok else f"({r.state}) {r.message}"
         if len(body) > MAX_RESULT:
             body = body[:MAX_RESULT] + " [...]"
+        asked = (r.input or s.input).split(context_start)[0]  # the task is given once below
         parts.append(
             f"### {s.id}: {s.skill} by {r.agent or 'no agent'} - {r.state}\n"
-            f"Asked: {r.input or s.input}\n\nResult:\n{body}"
+            f"Asked: {asked}\n\nResult:\n{body}"
         )
+    note = f"\n\n{WRITES_OFF.format(skills=', '.join(writes_off))}" if writes_off else ""
     messages = [
         {"role": "system", "content": COMBINE_PROMPT},
         {
             "role": "user",
-            "content": f"User's task:\n{task}\n\nStep results, in plan order:\n\n"
+            "content": f"User's task:\n{task}{note}\n\nStep results, in plan order:\n\n"
             + "\n\n".join(parts),
         },
     ]
@@ -744,16 +828,23 @@ async def orchestrate(
     plan_only: bool = False,
     on_line: Callable[[str], None] | None = None,
     model_name: str = "",
+    allow_writes: bool = False,
 ) -> Orchestration:
     """Plan, run and combine. ``policy`` sets retries, fallback and push; without one, each
     step gets ``step_timeout`` and the default policy. Cancelling this coroutine cancels
-    every remote task still running and records the run as canceled."""
+    every remote task still running and records the run as canceled.
+
+    Skills a card tags ``write`` are offered to the planner only with ``allow_writes``: in
+    M6 the planner added knowledge-base writes to tasks that only asked a question. The
+    M5 signature check stops unverified writes, this stops unrequested ones."""
     policy = policy or RunPolicy(step_timeout=step_timeout)
     run_id = str(uuid.uuid4())
     rec = Recorder(trace_root / "orchestrator" if trace_root else None, run_id, on_line)
     out = Orchestration(run_id, task, trace=rec.trace)
     try:
-        return await _orchestrate(task, cards, chat, http, rec, out, policy, plan_only, model_name)
+        return await _orchestrate(
+            task, cards, chat, http, rec, out, policy, plan_only, model_name, allow_writes
+        )
     except asyncio.CancelledError:
         out.state, out.message = "canceled", "the orchestration was cancelled"
         rec.event("run_end", stop_reason="cancelled", answer="")
@@ -771,8 +862,12 @@ async def _orchestrate(
     policy: RunPolicy,
     plan_only: bool,
     model_name: str,
+    allow_writes: bool = False,
 ) -> Orchestration:
     catalogue = build_catalogue(cards)
+    writes_off: list[str] = []
+    if not allow_writes:
+        catalogue, writes_off = without_writes(catalogue)
 
     def finish(state: str, message: str = "", stop: str = "final_answer") -> Orchestration:
         out.state, out.message = state, message
@@ -794,6 +889,11 @@ async def _orchestrate(
     )
     names = ", ".join(c.name for c in cards)
     rec.state("working", message=f"planning with {len(catalogue)} skills from {names}")
+    if writes_off:
+        rec.state(
+            "working",
+            message=f"writes are off, not offering: {', '.join(writes_off)} (--allow-writes)",
+        )
     if not catalogue:
         return finish("failed", "no agents with skills were found", stop="no_agents")
 
@@ -835,10 +935,10 @@ async def _orchestrate(
         out.answer = json.dumps({"steps": [s.to_dict() for s in out.plan]}, indent=2)
         return finish("completed")
 
-    out.results = await run_steps(out.plan, catalogue, http, rec, policy)
+    out.results = await run_steps(out.plan, catalogue, http, rec, policy, task)
     rec.state("working", message="combining the results")
     try:
-        reply = await combine(task, out.plan, out.results, chat)
+        reply = await combine(task, out.plan, out.results, chat, writes_off)
     except Exception as exc:
         return finish("failed", f"combining failed: {type(exc).__name__}: {exc}", stop="error")
     out.answer = reply.content.strip()

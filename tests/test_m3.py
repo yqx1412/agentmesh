@@ -12,6 +12,7 @@ import pytest
 from agentmesh.executor import RunOutcome
 from agentmesh.journal import JOURNAL_NAME, JsonlJournal
 from agentmesh.orchestrator import (
+    STEP_CONTEXT,
     ChatReply,
     PlanError,
     build_catalogue,
@@ -31,13 +32,15 @@ from agentmesh.watch import AgentInfo, Watcher
 # --- fixtures --------------------------------------------------------------------------
 
 
-def spec(name: str, port: int, skill: str, tmp_path: Path) -> AgentSpec:
+def spec(name: str, port: int, skill: str | SkillSpec, tmp_path: Path) -> AgentSpec:
+    if isinstance(skill, str):
+        skill = SkillSpec(id=skill, name=skill, description=f"does {skill}")
     return AgentSpec(
         name=name,
         description=f"{name} for tests",
         port=port,
         workspace=tmp_path / name,
-        skills=[SkillSpec(id=skill, name=skill, description=f"does {skill}")],
+        skills=[skill],
     )
 
 
@@ -213,12 +216,13 @@ async def test_chain_routes_by_card_and_passes_results_on(three, tmp_path):
         "Verifier",
         "Knowledge",
     ]
-    # Each agent got its step's text, with the earlier answer filled in.
+    # Each agent got its step's text, with the earlier answer filled in, then the user's task.
+    context = STEP_CONTEXT.format(task="Research local LLM inference and update my knowledge base")
     assert three.received["Verifier"] == [
-        "Check each claim against its source: 1. Claim A [https://a.example]"
+        "Check each claim against its source: 1. Claim A [https://a.example]" + context
     ]
     assert three.received["Knowledge"] == [
-        "Store only the SUPPORTED claims: 1. SUPPORTED - claim A"
+        "Store only the SUPPORTED claims: 1. SUPPORTED - claim A" + context
     ]
     # The combining model saw every step's result.
     combined = chat.calls[1][0][-1]["content"]

@@ -1,0 +1,38 @@
+{
+  "started": "2026-10-18T02:01:26",
+  "git_sha": "8fb35ba-dirty",
+  "systems": [
+    "single",
+    "multi"
+  ],
+  "tasks": [
+    "r-qwen-license",
+    "r-a2a-origin",
+    "r-ollama-port",
+    "r-llama-draft",
+    "r-mcp-definition",
+    "a-kv-cache",
+    "a-weights",
+    "a-latency-stats",
+    "a-throughput",
+    "k-radix-analogy",
+    "k-peak-timing",
+    "k-table-doubling",
+    "v-three-claims",
+    "c-qwen-kv",
+    "c-ollama-ratio",
+    "c-peak-speedup"
+  ],
+  "repeats": 3,
+  "solo": "http://127.0.0.1:9115",
+  "fleet": [
+    "http://127.0.0.1:9111",
+    "http://127.0.0.1:9112",
+    "http://127.0.0.1:9113",
+    "http://127.0.0.1:9114"
+  ],
+  "planner": "qwen3:14b",
+  "timeout": 1200.0,
+  "step_timeout": 600.0,
+  "task_file": "benchmarks\\m6\\tasks.yaml"
+}

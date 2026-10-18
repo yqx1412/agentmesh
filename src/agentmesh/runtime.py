@@ -146,14 +146,25 @@ class AnswerGuardLLM:
     def chat(self, messages: list[Message], tools: list[dict[str, Any]]) -> ChatResponse:
         resp = self.inner.chat(messages, tools)
         extra: list[Message] = []
+        p_tok = c_tok = 0  # tokens of the replies sent back
         while not resp.message.tool_calls and self.nudges < self.max_nudges:
             # Tool results fetched during earlier nudges count too.
             problem = self._problem(resp.message.content, [*messages, *extra])
             if problem is None:
                 break
             self.nudges += 1
+            p_tok += resp.prompt_tokens
+            c_tok += resp.completion_tokens
             extra += [resp.message, Message(role="user", content=problem)]
             resp = self.inner.chat([*messages, *extra], tools)
+        if p_tok or c_tok:
+            # M6: a refused reply still cost tokens; report them with the one the agent keeps.
+            resp = resp.model_copy(
+                update={
+                    "prompt_tokens": resp.prompt_tokens + p_tok,
+                    "completion_tokens": resp.completion_tokens + c_tok,
+                }
+            )
         return resp
 
 

@@ -1,0 +1,24 @@
+# M6 Solo agent: the Research web tools, the Knowledge read-only DomainGraph tools and the
+# Analyst's sandbox limits, in one agent. No add_fact / forget_fact / clear_scope /
+# ingest_source: the M6 task set never writes.
+[mcp_servers.web]
+command = "{python}"
+args = ["-m", "agentmesh.webtools"]
+tools = ["web_search", "fetch_url"]
+permission = "read"
+timeout = 60
+
+# {workspace} is agentmesh/workspace/solo, so this cwd is the sibling domaingraph repo.
+[mcp_servers.domaingraph]
+command = "uv"
+args = ["run", "--quiet", "domaingraph", "mcp"]
+cwd = "{workspace}/../../../domaingraph"
+tools = ["search", "get_concept", "related_concepts", "recall_facts", "list_facts"]
+permission = "read"
+startup_timeout = 120
+timeout = 120
+
+[sandbox]
+allowed_commands = []
+timeout = 30
+memory_mb = 512

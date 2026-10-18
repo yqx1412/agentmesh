@@ -192,6 +192,41 @@ users or containers per agent. The source check matches URLs, not statements: a 
 the Verifier never saw can still be stored under a URL that supported some other
 claim, as long as the per-claim count allows it.
 
+## M6: one agent vs. the whole fleet
+
+The headline result of AgentMesh: the same 16 tasks, 3 times each, on a single AgentOS
+agent with every specialist's tools (`agents/solo.toml`, port 9115) and on the fleet
+through the orchestrator. Full write-up:
+[`benchmarks/results/m6-single-vs-multi.md`](benchmarks/results/m6-single-vs-multi.md).
+
+```powershell
+uv run agentmesh up --trace-dir runs/fleet-traces
+uv run agentmesh serve agents/solo.toml --trace-dir runs/fleet-traces/solo
+uv run agentmesh eval run --out runs/m6/full --repeats 3   # resumable
+uv run agentmesh eval report runs/m6/full
+```
+
+| | single | multi |
+|---|---|---|
+| Runs passed | 35/48 (73%) | 39/48 (81%) |
+| Passed, every cited page fetched | 23/48 (48%) | 37/48 (77%) |
+| Median time per run | 27 s | 45 s |
+| Mean tokens per run | 4,707 | 16,032 |
+| Composite (two skills chained) | 6/9 | 2/9 |
+
+- **The fleet helps** where a specialist's rule is enforced in code: the single agent
+  cited pages it never fetched in all 14 of its citing answers, and called true claims
+  false without fetching them. The fleet also picked the right tool more reliably
+  (web vs. lecture notes).
+- **It hurts** on chained tasks: each step sees only the planner's rewrite of the
+  task, so needed inputs went missing and one question got inverted. It also costs
+  about 3.4x the tokens and 1.7x the time, and the planner added a knowledge-base write
+  nobody asked for.
+- **Scoring** is deterministic on the final answer (phrases, numbers, regexes, lecture
+  timestamps), plus a citation check against the pages each system's traces show it
+  fetched. Tokens are summed over every model call, including replies the answer guard
+  sent back.
+
 ## Development
 
 ```powershell

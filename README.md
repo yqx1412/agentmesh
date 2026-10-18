@@ -102,7 +102,7 @@ combines the results into one answer.
 
 ```powershell
 uv run agentmesh up --trace-dir runs/fleet-traces
-uv run agentmesh orchestrate "Research local LLM inference and update my knowledge base"
+uv run agentmesh orchestrate "Research local LLM inference and update my knowledge base" --allow-writes
 uv run agentmesh orchestrate "..." --plan-only       # print the plan, send nothing
 ```
 
@@ -152,7 +152,7 @@ writes only what the Verifier signed off on.
 uv run agentmesh auth init                 # secrets/ (git-ignored): tokens + Verifier key
 uv run agentmesh up --trace-dir runs/fleet-traces          # logins on by default
 uv run agentmesh ask http://127.0.0.1:9114 "What is radix sort?" --skill knowledge_lookup
-uv run agentmesh orchestrate "Research local LLM inference and update my knowledge base"
+uv run agentmesh orchestrate "Research local LLM inference and update my knowledge base" --allow-writes
 ```
 
 - **Logins:** every caller (principal) has its own random bearer token in
@@ -226,6 +226,38 @@ uv run agentmesh eval report runs/m6/full
   timestamps), plus a citation check against the pages each system's traces show it
   fetched. Tokens are summed over every model call, including replies the answer guard
   sent back.
+
+### After M6: chained-task fixes
+
+Four changes to the orchestrator for the fleet weaknesses M6 found:
+
+- **Every step also receives the user's task**, after the planner's input and marked as
+  context only, so a step isn't limited to the planner's rewording. The planner is also
+  told to ask for every input a later computation needs, in the task's direction.
+- **`CANNOT: <reason>` fails the step.** Every step is told it may reply with that line
+  when an input is missing or a tool failed. The orchestrator then treats the attempt
+  as failed, so retries and fallback run and dependent steps are skipped instead of
+  receiving an apology as data.
+- **Writes only when asked for.** Skills a card tags `write` (Knowledge's
+  `knowledge_write`) are hidden from the planner unless `orchestrate --allow-writes`
+  is given, and the combiner is told when they were. M5's signature check stops
+  unverified writes; this stops unrequested ones.
+- **Re-plan on a missing input.** When a step still fails with `CANNOT` after its
+  retries, the planner is called once more (`--replans`, default 1, 0 turns it off). It
+  sees every step so far with its result or `CANNOT` reason, and writes only new steps:
+  they may use completed results with `{{sN}}`, so finished work isn't repeated, may not
+  reuse earlier ids, and must use the failed step's skill again (a re-plan that only
+  fetched the missing value once left the combiner to do the arithmetic, wrongly). The
+  steps they replace are marked `replaced`.
+
+Rerun of the 3 composite tasks on the fleet, 3 times each: **6/9, up from 2/9**. The
+context-window ratio now passes 3/3 (was 0/3) and the lecture speed-up 3/3 (was 2/3).
+The Qwen3-8B KV-cache task failed 0/3 before re-planning was added: the plan didn't ask
+Research for the context length, and the Analyst replied `CANNOT` instead of guessing
+one. With re-planning, all 3 runs computed the right 4.5 GiB (Research -> Analyst
+`CANNOT` -> Research for the context length -> Analyst), and 1 of 3 passed; the other
+two final answers left out the looked-up layer count the task's check also requires.
+No plan included a write.
 
 ## Development
 

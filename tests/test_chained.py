@@ -14,12 +14,16 @@ from test_m3 import Fleet, ScriptedChat, answers, plan, step
 from agentmesh.executor import RunOutcome
 from agentmesh.orchestrator import (
     STEP_CONTEXT,
+    PlanError,
     RunPolicy,
     build_catalogue,
     cannot_reason,
     describe_catalogue,
     discover_all,
     orchestrate,
+    parse_plan,
+    plan_inputs,
+    plan_schema,
     without_writes,
 )
 from agentmesh.spec import SkillSpec
@@ -62,6 +66,10 @@ async def test_every_step_receives_the_users_task(tmp_path):
     combined = chat.calls[1][0][-1]["content"]
     assert combined.count(TASK) == 1
     assert "Asked: Divide: native context 32768, window 4096\n" in combined
+    # The task's format instructions are for the final reply only (a Research step once
+    # ended with the task's "RATIO:" line and the final answer kept it).
+    assert "are for the final reply to the user, not for you" in context
+    assert "it does not replace the rest of these rules" in chat.calls[1][0][0]["content"]
 
 
 # --- 2. "I couldn't" fails the step ----------------------------------------------------
@@ -295,3 +303,59 @@ async def test_other_failures_do_not_replan(tmp_path):
     out = await orchestrate("t", await cards_of(fleet), chat, fleet.http, policy=NO_WAIT)
     assert out.state == "failed" and out.replans == 0
     assert len(chat.calls) == 2
+
+
+# --- the planner names every input first ----------------------------------------------
+
+
+def test_plan_schema_asks_for_inputs_before_steps():
+    # Constrained decoding writes properties in schema order, so "inputs" must come first:
+    # live, listing the values first is what made the KV-cache plan ask for the context
+    # length in its first step instead of after a CANNOT and a re-plan.
+    schema = plan_schema(["web_research"])
+    assert list(schema["properties"]) == ["inputs", "steps"]
+    assert schema["required"] == ["inputs", "steps"]
+    item = schema["properties"]["inputs"]["items"]
+    assert item["required"] == ["value", "source"]
+
+
+def test_plan_inputs_reads_the_list_and_tolerates_its_absence():
+    reply = '{"inputs": [{"value": "native context length", "source": "s1"}, "junk"], "steps": []}'
+    assert plan_inputs(reply) == [{"value": "native context length", "source": "s1"}]
+    assert plan_inputs('{"steps": []}') == []
+    assert plan_inputs("not json") == []
+    assert plan_inputs('{"inputs": "s1"}') == []
+
+
+def _one_step(text: str) -> str:
+    return plan(step("s1", "calculate", text))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Compute the KV cache using the formula: layers x heads.",
+        "Compute (layers * kv_heads * head_dim * tokens * 2) / (1024^3).",
+        "Compute layers \u00d7 kv_heads \u00d7 head_dim.",
+        "Divide by 1024**3.",
+    ],
+)
+def test_a_step_input_may_not_spell_out_a_formula(text):
+    # Live, the planner wrote the KV-cache formula without the x2 for keys and values; the
+    # Analyst followed it and all three runs got the size wrong.
+    cat = {"calculate": [object()]}
+    with pytest.raises(PlanError, match="formula or method"):
+        parse_plan(_one_step(text), cat, task="KV cache of Qwen3-8B?")
+
+
+def test_names_values_without_a_formula_and_a_formula_from_the_task_pass():
+    cat = {"calculate": [object()]}
+    ok = "Compute the fp16 KV-cache size in GiB from the layers, KV heads and head dim."
+    assert parse_plan(_one_step(ok), cat, task="t")
+    # The user's own formula may be passed on (a-weights says "1 GiB = 2^30 bytes").
+    task = "How many GiB do 8.2B fp16 weights take (1 GiB = 2^30 bytes)?"
+    assert parse_plan(
+        _one_step("Compute 8.2B x 2 bytes in GiB, 1 GiB = 2^30 bytes."), cat, task=task
+    )
+    # Markdown bold is not multiplication.
+    assert parse_plan(_one_step("Compute the **KV-cache** size."), cat, task="t")

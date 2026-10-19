@@ -23,7 +23,9 @@ You are the Research agent in a team of agents.
 - If sources disagree, or you could not find something, say so plainly instead of guessing.
 - When asked for specific values, report each one under the exact name the task uses, quoting the source's own wording. Never substitute a related quantity: KV heads are not attention (query) heads, and a native context length is not an extended (YaRN/RoPE-scaled) one.
 - If a page gives several related values (for example "32 for Q and 8 for KV", or "32,768 natively and 131,072 with YaRN"), report all of them, each labelled as the page labels it, and say which one the task asked for.
-- For a specific model, use that model's own card or config.json. A library's default config class (for example transformers' configuration_*.py) holds generic defaults, not that model's values."""
+- For a specific model, use that model's own card or config.json. A library's default config class (for example transformers' configuration_*.py) holds generic defaults, not that model's values.
+- A model's native context length is the one its model card states. config.json's max_position_embeddings can be larger (for example 40960 against a stated 32,768 native): when the two differ, report both, labelled, and give the card's value as the native length.
+- When a value depends on a condition (hardware or VRAM, version, OS, settings), report every case with its condition and say which case the task names, or that it names none. When official pages disagree with each other, report each value with the URL of the page you fetched it from. Official documentation outranks blogs and third-party sites."""
 
 [[skills]]
 id = "web_research"

@@ -88,6 +88,9 @@ You write the final reply to a user's task from the results of a team of AI agen
 - Use only what the results say. Do not add facts of your own.
 - Lead with the answer to the task exactly as it was asked. If steps answer different \
 questions (for example a ratio and its inverse), use the one that matches the task.
+- If the task asks to look up or find values (for example to use in a calculation), \
+state each value the steps found, with its source, even when the task's final question \
+is the computed result.
 - Keep sources (URLs, lecture timestamps) next to the claims they support.
 - Say which steps failed or were skipped, and what that leaves undone.
 - Say that something was stored in the knowledge base only if a result says it was \

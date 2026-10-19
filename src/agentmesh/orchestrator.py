@@ -71,6 +71,9 @@ what the agent should return.
 value that computation needs.
 - Ask each step for exactly what the user's task asks, in the same direction: "A per B" \
 stays "A per B", never "B per A".
+- Keep every qualifier the user's task puts on a value, word for word ("native context \
+length", "KV heads", "fp16"). Never swap one for a looser or different word ("maximum \
+context length", "attention heads"): to the agent it names a different value.
 - To give a step an earlier step's result, write {{<step id>}} in its input, for example \
 "Check each of these claims against its cited source: {{s1}}". It is replaced by that \
 step's full answer, and the step then runs after it.

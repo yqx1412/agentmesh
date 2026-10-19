@@ -262,6 +262,12 @@ source. Rerun 3 times: **2/3 passed**, and all 3 answers listed the layer count.
 failure was a lookup error, not the summary: Research gave the 32 attention heads where
 the task asked for the KV heads (8), and the calculation used the 131,072-token YaRN
 context although Research also reported the 32,768 native one, giving 72 GiB.
+Research is now told to report each value under the exact name the task uses, never a
+related one (KV heads are not attention heads, native context is not YaRN-extended), to
+list every related value a page gives with its label, and to prefer the model's own card
+over a library's default config. The planner is told to keep the task's qualifiers word
+for word. Rerun 3 times: **3/3 passed**, each with 8 KV heads and 32,768 tokens (4.5 GiB),
+and the five research tasks still passed 5/5 with no unfetched citations.
 No plan included a write.
 
 ## Development

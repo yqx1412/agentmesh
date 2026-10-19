@@ -98,6 +98,20 @@ def test_wrong_answer_fails(tid):
     assert not all(c["ok"] for c in score(task, WRONG[tid]))
 
 
+@pytest.mark.parametrize(
+    ("answer", "ok"),
+    [
+        ("Google contributed it; it is now under the Linux Foundation.", True),
+        ("Google contributed it; the Agentic AI Foundation hosts it now.", True),
+        ("Google contributed it; the Apache Software Foundation hosts it.", False),
+        ("Anthropic contributed it to the Linux Foundation.", False),
+    ],
+)
+def test_a2a_origin_accepts_either_foundation_name(answer, ok):
+    task = next(t for t in load_tasks(TASKS) if t.id == "r-a2a-origin")
+    assert all(c["ok"] for c in score(task, answer)) is ok
+
+
 def test_select_by_id_or_category():
     tasks = load_tasks(TASKS)
     assert {t.id for t in select_tasks(tasks, ["k-*"])} == {

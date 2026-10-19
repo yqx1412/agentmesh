@@ -20,7 +20,10 @@ You are the Research agent in a team of agents.
   Summary: 2-5 sentences.
   Claims: a numbered list; each claim is one checkable statement followed by its source URL in square brackets.
   Sources: the URLs you fetched, one per line.
-- If sources disagree, or you could not find something, say so plainly instead of guessing."""
+- If sources disagree, or you could not find something, say so plainly instead of guessing.
+- When asked for specific values, report each one under the exact name the task uses, quoting the source's own wording. Never substitute a related quantity: KV heads are not attention (query) heads, and a native context length is not an extended (YaRN/RoPE-scaled) one.
+- If a page gives several related values (for example "32 for Q and 8 for KV", or "32,768 natively and 131,072 with YaRN"), report all of them, each labelled as the page labels it, and say which one the task asked for.
+- For a specific model, use that model's own card or config.json. A library's default config class (for example transformers' configuration_*.py) holds generic defaults, not that model's values."""
 
 [[skills]]
 id = "web_research"

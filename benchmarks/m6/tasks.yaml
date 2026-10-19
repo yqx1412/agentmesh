@@ -29,7 +29,10 @@ tasks:
       Which company contributed the Agent2Agent (A2A) protocol, and which foundation hosts
       the project now? Cite your sources.
     checks:
-      - {type: answer_contains, values: [google, linux foundation]}
+      - {type: answer_contains, values: [google]}
+      # A2A blog, 2026-08-27: now hosted by the Agentic AI Foundation, which is
+      # "Linux Foundation-directed"; either name is a correct answer.
+      - {type: answer_regex, pattern: 'linux foundation|agentic ai foundation'}
 
   - id: r-ollama-port
     category: research

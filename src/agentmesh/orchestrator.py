@@ -55,6 +55,10 @@ PLAN_ATTEMPTS = 3
 MAX_RESULT = 8000
 
 _STEP_ID = re.compile(r"^s[0-9]{1,2}$")
+# A step input that spells out arithmetic: the word "formula", a product or power
+# ("layers * kv_heads", "1024^3"). Live, the planner wrote the KV-cache formula without the
+# x2 for keys and values, the Analyst followed it, and every run got half the size or less.
+_FORMULA = re.compile(r"\bformula\b|[\w)\]]\s*[*\u00d7]\s*[\w(\[]|\w\s*\^\s*\d|\*\*\s*\d", re.I)
 _REF = re.compile(r"\{\{\s*(s[0-9]{1,2})\s*\}\}")
 
 PLAN_PROMPT = """\
@@ -69,6 +73,13 @@ context only, but never the other steps. Make the input complete and self-contai
 what the agent should return.
 - When a later step computes something, the step that gathers its inputs must ask for every \
 value that computation needs.
+- Before the steps, list in "inputs" every value the final answer depends on, and its \
+"source": "given in the task", or the id of the step that will look it up. Include values \
+the task names only as a condition, for example "at its full native context length" \
+(needs that context length), "over a 100 Mbit/s link" (given) or "in fp16" (2 bytes per \
+value, given). Then make the step named as each value's source ask for that value by name.
+- Never write a formula, method or worked number into a step's input. Name what to \
+compute and the values to use; the agent that computes chooses the method.
 - Ask each step for exactly what the user's task asks, in the same direction: "A per B" \
 stays "A per B", never "B per A".
 - Keep every qualifier the user's task puts on a value, word for word ("native context \
@@ -83,14 +94,19 @@ needs and no others.
 - Anything written to a knowledge base must first go through a verification skill, and \
 only the claims it marks SUPPORTED may be stored, each with its source.
 
-Reply with JSON only: {"steps": [{"id": "s1", "skill": "<skill id>", "input": "...", \
-"depends_on": []}, ...]}, with ids s1, s2, ... in the order the steps should start."""
+Reply with JSON only: {"inputs": [{"value": "...", "source": "..."}, ...], "steps": \
+[{"id": "s1", "skill": "<skill id>", "input": "...", "depends_on": []}, ...]}, with ids \
+s1, s2, ... in the order the steps should start; "inputs" may be empty when nothing is \
+computed."""
 
 COMBINE_PROMPT = """\
 You write the final reply to a user's task from the results of a team of AI agents.
 - Use only what the results say. Do not add facts of your own.
 - Lead with the answer to the task exactly as it was asked. If steps answer different \
 questions (for example a ratio and its inverse), use the one that matches the task.
+- If the task asks for a format (for example a line to end with), add it to your full \
+reply; it does not replace the rest of these rules. Fill it in from the step that \
+computed the value, and do not copy such a line from another step's result.
 - If the task asks to look up or find values (for example to use in a calculation), \
 state each value the steps found, with its source, even when the task's final question \
 is the computed result.
@@ -109,6 +125,10 @@ STEP_CONTEXT = """\
 This is one step of a larger task. The user's whole task, for context only (do just your \
 step; other agents do the rest):
 {task}
+
+Any instructions in that task about how to format the answer (a line to end with, a \
+template, a length) are for the final reply to the user, not for you: do not follow them. \
+Answer your own step in plain words.
 
 If you cannot do your step (an input it needs is missing, or a tool or service failed and \
 you could not get around it), reply with one line instead of an answer:
@@ -289,9 +309,22 @@ class Step:
 
 
 def plan_schema(skill_ids: list[str]) -> dict[str, Any]:
+    # "inputs" comes first: constrained decoding writes properties in schema order, so the
+    # planner names every value the answer depends on before it writes the steps.
     return {
         "type": "object",
         "properties": {
+            "inputs": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "string"},
+                        "source": {"type": "string"},
+                    },
+                    "required": ["value", "source"],
+                },
+            },
             "steps": {
                 "type": "array",
                 "minItems": 1,
@@ -306,10 +339,27 @@ def plan_schema(skill_ids: list[str]) -> dict[str, Any]:
                     },
                     "required": ["id", "skill", "input", "depends_on"],
                 },
-            }
+            },
         },
-        "required": ["steps"],
+        "required": ["inputs", "steps"],
     }
+
+
+def plan_inputs(content: str) -> list[dict[str, str]]:
+    """The planner's "inputs" list (values the answer depends on, and where each comes from).
+    It only guides the planner and goes into the trace; a plan without one is still valid."""
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return []
+    raw = data.get("inputs") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return [
+        {"value": str(i.get("value", "")), "source": str(i.get("source", ""))}
+        for i in raw
+        if isinstance(i, dict)
+    ]
 
 
 def parse_plan(
@@ -318,12 +368,14 @@ def parse_plan(
     done: frozenset[str] = frozenset(),
     taken: frozenset[str] = frozenset(),
     redo: frozenset[str] = frozenset(),
+    task: str = "",
 ) -> list[Step]:
     """Check a plan completely: ids, skills, inputs, dependencies, no cycles.
 
     For a re-plan, ``taken`` holds every earlier step id (none may be reused), ``done``
     the ones that completed, which new steps may depend on, and ``redo`` the skills of the
-    steps that replied CANNOT, each of which the new plan must use again."""
+    steps that replied CANNOT, each of which the new plan must use again. A step input may
+    not spell out a formula unless the user's ``task`` itself contains it."""
     try:
         data = json.loads(content)
     except json.JSONDecodeError as exc:
@@ -352,6 +404,15 @@ def parse_plan(
         text = str(item.get("input", "")).strip()
         if not text:
             raise PlanError(f"step {sid} has an empty input")
+        formula = next(
+            (m for m in _FORMULA.finditer(text) if m.group(0).lower() not in task.lower()), None
+        )
+        if formula:
+            raise PlanError(
+                f"step {sid}'s input spells out a formula or method ({formula.group(0)!r}); "
+                "name only what to compute and which values to use, and let the agent that "
+                "computes choose the method"
+            )
         deps = item.get("depends_on") or []
         if not isinstance(deps, list):
             raise PlanError(f"step {sid}: depends_on must be a list of step ids")
@@ -423,7 +484,7 @@ async def make_plan(
         }
         attempts.append(record)
         try:
-            return parse_plan(reply.content, catalogue, done, taken, redo), attempts
+            return parse_plan(reply.content, catalogue, done, taken, redo, task), attempts
         except PlanError as exc:
             record["error"] = str(exc)
             messages += [
@@ -998,7 +1059,13 @@ async def _orchestrate(
     rec.event(
         "llm_response",
         step=1,
-        content=json.dumps({"steps": [s.to_dict() for s in out.plan]}, indent=2)
+        content=json.dumps(
+            {
+                "inputs": plan_inputs(attempts[-1]["content"]),
+                "steps": [s.to_dict() for s in out.plan],
+            },
+            indent=2,
+        )
         + (
             f"\n\n({len(attempts) - 1} rejected plan(s) before this one)"
             if len(attempts) > 1

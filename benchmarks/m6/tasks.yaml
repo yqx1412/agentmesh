@@ -4,6 +4,7 @@
 #   Qwen3-8B model card + config.json (Apache-2.0, 32,768 native, 36 layers, 8 KV heads, 128)
 #   github.com/a2aproject/A2A README ("under the Linux Foundation, contributed by Google")
 #   docs.ollama.com/faq ("binds 127.0.0.1 port 11434", "context window size of 4096 tokens")
+#   docs.ollama.com/context-length (2026-10-19: "< 24 GiB VRAM: 4k context")
 #   modelcontextprotocol.io intro ("open-source standard...", "like a USB-C port")
 #   llama.cpp docs/speculative.md ("--spec-draft-model, -md, --model-draft")
 #   DomainGraph chunks: L7 [39] 45:27 "Excel spreadsheet approach", L1 [28] 35:06 "13 seconds
@@ -153,10 +154,15 @@ tasks:
   - id: c-ollama-ratio
     category: composite
     cites: true
+    # Pinned to the < 24 GiB VRAM tier on 2026-10-19: docs.ollama.com/context-length now
+    # makes the default depend on VRAM (4k / 32k / 256k), while /faq still says 4096, so
+    # the unpinned question had no single right answer. M6's published runs used the
+    # unpinned prompt.
     prompt: >-
-      Find Ollama's default context window size in tokens in its documentation and Qwen3-8B's
-      native context length in its model card. How many of Ollama's default windows fit in
-      Qwen3-8B's native context? End with one line "RATIO: <number>".
+      Find Ollama's default context window size in tokens in its documentation, for a GPU
+      with less than 24 GiB of VRAM, and Qwen3-8B's native context length in its model
+      card. How many of Ollama's default windows fit in Qwen3-8B's native context? End with
+      one line "RATIO: <number>".
     checks:
       - {type: answer_number, value: 4096}
       - {type: answer_regex, pattern: 'RATIO:\s*8(\.0+)?\s*$'}

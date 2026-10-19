@@ -268,6 +268,37 @@ list every related value a page gives with its label, and to prefer the model's 
 over a library's default config. The planner is told to keep the task's qualifiers word
 for word. Rerun 3 times: **3/3 passed**, each with 8 KV heads and 32,768 tokens (4.5 GiB),
 and the five research tasks still passed 5/5 with no unfetched citations.
+The planner still never asked for the context length in its first plan, so every KV run
+needed a re-plan. Its JSON reply now starts with an `inputs` list (every value the answer
+depends on, and which step gets it, including values the task names only as a condition,
+like "at its full native context length"); constrained decoding writes it before the
+steps. The first live try showed a new failure: the planner then wrote the formula into
+the Analyst's step, without the x2 for keys and values, and all 3 runs got it wrong. A
+step input that spells out a formula (`*`, `^`, "formula") is now sent back unless the
+user's task contains it. Rerun 3 times: every plan asked for the context length up front,
+no run re-planned (about 100 s per run, down from about 350 s), and **2/3 passed**. The
+failure took the context length from `config.json`'s `max_position_embeddings` (40,960)
+instead of the card's 32,768 native tokens.
+Research is now told that a model's native context length is the one its card states
+(report config.json's `max_position_embeddings` beside it when they differ), to report
+every case of a value that depends on a condition such as VRAM, and to rank official docs
+above blogs. The ratio task now names the VRAM tier: Ollama's docs changed, and
+`/context-length` gives 4k, 32k or 256k by VRAM while `/faq` still says 4096. Rerun: KV
+cache **3/3** and ratio **5/6** (all six had 4,096 and 32,768 right; the failure ended
+with Research's own "RATIO: 0.25", which it wrote because the user's task, shown to every
+step for context, asks for that line), and the five research tasks 5/5.
+Each step is now told that the task's format instructions (a line to end with, a
+template) are for the final reply only, and the final summary adds the requested format
+to its full reply, filled in from the step that computed the value. In 6 ratio runs none
+of the 12 Research steps wrote a `RATIO:` line. A first wording of the summary rule made
+it reply with only "RATIO: 8.0" (ratio 1/3); after rewording, ratio **3/3** with 4,096
+and 32,768 stated. KV cache 5/6 across both rounds (the failure: the Analyst left out the
+x2 for keys and values and got 2.25 GiB), lecture speed-up 3/3 (first round only).
+The Analyst is now told to give every factor of a formula its own named variable, never a
+bare number, and that the KV cache's two factors of 2 at fp16 (key and value, 2 bytes per
+element) are separate. Rerun: all three composite tasks **3/3** (9/9; every KV script
+had both `kv_tensors` and `bytes_per_element`, 4.5 GiB each time), and the four analysis
+tasks 4/4.
 No plan included a write.
 
 ## Development

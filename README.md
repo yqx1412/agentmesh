@@ -257,6 +257,11 @@ Research for the context length, and the Analyst replied `CANNOT` instead of gue
 one. With re-planning, all 3 runs computed the right 4.5 GiB (Research -> Analyst
 `CANNOT` -> Research for the context length -> Analyst), and 1 of 3 passed; the other
 two final answers left out the looked-up layer count the task's check also requires.
+The final summary is now told to state every value the task asked to look up, with its
+source. Rerun 3 times: **2/3 passed**, and all 3 answers listed the layer count. The
+failure was a lookup error, not the summary: Research gave the 32 attention heads where
+the task asked for the KV heads (8), and the calculation used the 131,072-token YaRN
+context although Research also reported the 32,768 native one, giving 72 GiB.
 No plan included a write.
 
 ## Development

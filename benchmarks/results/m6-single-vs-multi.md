@@ -10,6 +10,14 @@ two skills, because splitting the task loses information between steps. It costs
 3.4x the tokens and 1.7x the time. With 16 tasks and 3 repeats, the overall gap (81% vs
 73% of runs passed) is small enough that it should be read per category, not as one score.
 
+**Update, 2026-10-19:** after the orchestrator, Research and Analyst fixes that came out
+of this evaluation (PRs #8-#12), a full rerun with the same tasks and settings passed
+47/48 on the fleet and 34/48 on the unchanged single agent, and the fleet won all 9
+composite runs. Those fixes were tuned on these same composite tasks, so that 9/9
+overstates how the fleet would do on new chained tasks. See
+[Rerun with the fixes](#rerun-with-the-fixes-2026-10-19). The sections before it
+describe the original 2026-10-18 run.
+
 Raw data: [`m6/results.jsonl`](m6/results.jsonl) (one line per run, with the answer,
 check results, cost and fetched pages), [`m6/report.md`](m6/report.md) (all tables),
 [`m6/meta.json`](m6/meta.json). Tasks: [`../m6/tasks.yaml`](../m6/tasks.yaml).
@@ -166,6 +174,87 @@ the single agent.
    and would likely remove most of the fleet's research advantage at a fraction of its
    cost.
 4. **Don't let the planner add writes the task didn't ask for.**
+
+Items 1, 2 and 4 are done (see the rerun below); item 3 is not, so the single agent in
+the rerun is the same one as here.
+
+## Rerun with the fixes (2026-10-19)
+
+The same 16 tasks, 3 repeats per system, the same timeouts (1,200 s per run, 600 s per
+step) and the same hardware, on `main` at `1b7824a`. Raw data:
+[`m6-rerun/results.jsonl`](m6-rerun/results.jsonl),
+[`m6-rerun/report.md`](m6-rerun/report.md), [`m6-rerun/meta.json`](m6-rerun/meta.json).
+
+What changed in the fleet since the first run (all in the orchestrator or the agents'
+prompts; models, tools and code-enforced rules are the same):
+
+- every step also receives the user's task; a step can fail with `CANNOT: <reason>`,
+  and the planner re-plans once when one does (PR #8)
+- the final summary states each value the task asked to look up, with its source (#9)
+- Research reports values under the exact name the task uses, prefers the model's own
+  card, and cites only pages it fetched (#11, #12)
+- the planner lists every input before its steps, and may not write a formula into a
+  step (#12)
+- delegated steps ignore the task's formatting instructions; the Analyst names every
+  factor of a formula (#12)
+- skills tagged `write` are hidden from the planner unless `--allow-writes` is given,
+  which the evaluation doesn't pass (#8)
+
+The single agent's spec (`agents/solo.toml`) did not change.
+
+| | single, first run | multi, first run | single, rerun | multi, rerun |
+|---|---|---|---|---|
+| Runs passed | 35/48 | 39/48 | 34/48 | 47/48 |
+| Passed, every cited page fetched | 23/48 | 37/48 | 23/48 | 46/48 |
+| Checks passed | 58/75 | 64/75 | 60/78 | 77/78 |
+| Median / mean time per run | 27 / 34 s | 45 / 59 s | 31 / 39 s | 44 / 51 s |
+| Mean tokens per run | 4,707 | 16,032 | 5,501 | 20,438 |
+| Runs that cited an unfetched page | 14 of 14 | 2 of 19 | 13 of 13 | 1 of 18 |
+| Composite passed | 6/9 | 2/9 | 6/9 | 9/9 |
+
+The check count went from 75 to 78 because the A2A task's host check became a separate
+check that accepts either the Linux Foundation or the Agentic AI Foundation (#10).
+
+**Composite tasks, fleet:** KV cache 0/3 -> 3/3, context-window ratio 0/3 -> 3/3,
+lecture speed-up 2/3 -> 3/3. The composite median time fell from 122 s to 82 s; the
+ratio task alone went from 246 s to 91 s, since the plan no longer has a fourth step
+asking for the inverse ratio. **The MCP question** went from 1/3 to 3/3. Fleet tokens
+rose on research (18.9k -> 28.7k per run) and verification (30.6k -> 40.0k), so the
+fleet now costs about 3.7x the single agent's tokens (3.4x before) at an unchanged
+median time.
+
+**The fleet's one failure is a regression,** on `r-qwen-license` (3/3 -> 2/3). In all 3
+runs the planner added a `claim_verification` step to this plain lookup (median 67 s,
+was 45 s). In the failed run, Research's two other fetches failed (an NVIDIA PDF, which the
+fetch tool can't read, and a 403), so it fetched the Hugging Face card twice. The card's page shows
+"License: apache-2.0" in its header, but the text the fetch tool extracted from it
+contains neither "license" nor "apache"; the license was only in the search snippets.
+Under the new "cite only pages you fetched" rule, Research said the license was "not
+directly provided in the fetched content". That is honest, but it fails the task. In
+another of the 3 runs, the final answer cited that NVIDIA PDF, which no agent had
+fetched: the fleet's only unfetched citation in the rerun.
+
+**Single agent:** its 1-run differences from the first run (35 -> 34 passed:
+`r-qwen-license` 3 -> 2, `r-llama-draft` 1 -> 2, `v-three-claims` 1 -> 0) are what an
+unchanged agent varies by. Its failures are the same kinds as before: every citing
+answer cited a page it never fetched, it searched the lecture notes for the MCP
+question in all 3 runs, and on the claim check it now answered "FALSE: 2,3" all 3 times.
+
+Per task, the fleet passed more often on 6 tasks, less often on none and equally on 10.
+
+**How to read it:**
+
+- **Not a fresh measurement of the fixes.** Every prompt rule above was written after
+  reading failures on these composite tasks, and checked live on them, so 9/9 shows the
+  fixes work on the cases they were written for, not on chained tasks in general.
+- **The ratio task's wording changed:** it now names a GPU with less than 24 GiB of
+  VRAM, because Ollama's docs now give a different default per VRAM tier. On that task
+  the two runs aren't measuring the same thing.
+- **No writes were possible.** With write skills hidden by default, the planner couldn't
+  add the unrequested writes it added in the first run, so this rerun doesn't test
+  whether it still would with `--allow-writes`.
+- The earlier caveats (16 self-written tasks, repeats that aren't independent, guards
+  as a confound, tokens across two model sizes) still apply.
 
 ## Reproducing
 

@@ -301,6 +301,22 @@ had both `kv_tensors` and `bytes_per_element`, 4.5 GiB each time), and the four 
 tasks 4/4.
 No plan included a write.
 
+**Full M6 rerun with these fixes** (2026-10-19, same tasks and settings; details in the
+[write-up](benchmarks/results/m6-single-vs-multi.md#rerun-with-the-fixes-2026-10-19),
+raw data in `benchmarks/results/m6-rerun/`):
+
+| | single | multi |
+|---|---|---|
+| Runs passed | 34/48 (M6: 35) | 47/48 (M6: 39) |
+| Passed, every cited page fetched | 23/48 (M6: 23) | 46/48 (M6: 37) |
+| Composite | 6/9 (M6: 6) | 9/9 (M6: 2) |
+| Median time / mean tokens | 31 s / 5.5k | 44 s / 20.4k |
+
+The single agent's spec is unchanged. The fleet's one failure is a new regression on the
+Qwen3-8B license lookup: the fetched text of the model card doesn't contain the license,
+and Research, now told to cite only fetched pages, said so. The prompt rules were tuned
+on these same composite tasks, so 9/9 overstates the fleet on new chained tasks.
+
 ## Development
 
 ```powershell

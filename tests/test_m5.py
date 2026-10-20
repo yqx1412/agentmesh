@@ -12,7 +12,7 @@ from a2a.types import GetTaskRequest
 from agentos.tools import Tool, ToolError
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from agentmesh.access import GRANT, Access, Grant, Refused
+from agentmesh.access import GRANT, Access, Grant, Refused, read_write_result
 from agentmesh.auth import (
     PRINCIPALS_FILE,
     AttestationError,
@@ -431,6 +431,99 @@ def test_grant_narrows_tools_and_gates_attested_writes():
         add({"statement": "y", "details": {"source": "https://a.example/doc"}})
     assert len(stored) == 1
     assert apply_grant(tools, None) == tools  # no logins, no change
+
+
+def test_a_duplicate_write_is_named_as_one_to_the_model():
+    results = iter(['{"id": 7, "statement": "x", "new": true}', '{"id": 7, "new": false}'])
+    grant = Grant("o", "w", None, ["add_fact"])
+    grant.budget.update({"https://a.example": 2})
+    (add,) = apply_grant([_tool("add_fact", lambda a: next(results))], grant)
+    first = add.fn({"statement": "x", "source": "https://a.example"})
+    assert "ALREADY STORED" not in first
+    second = add.fn({"statement": "x", "source": "https://a.example"})
+    assert second.startswith("ALREADY STORED") and "id 7" in second
+    assert [(w.id, w.new) for w in grant.writes] == [(7, True), (7, False)]
+    report = grant.write_report()
+    assert "id 7: stored as new: x" in report
+    assert "id 7: already stored, not added again: x" in report
+
+
+def test_write_result_reading_tolerates_odd_results():
+    rec = read_write_result({"statement": "  a   b "}, "not json")
+    assert (rec.statement, rec.id, rec.new) == ("a b", None, None)
+    rec = read_write_result({"statement": "a"}, {"id": 3, "new": False})
+    assert (rec.id, rec.new) == (3, False)
+    assert Grant("o", "w").write_report() == ""
+
+
+async def test_knowledge_answer_carries_the_tool_write_record(tmp_path):
+    """The model says "stored" for a duplicate; the code-built record says otherwise."""
+    dir_ = tmp_path / "secrets"
+    init_auth(dir_)
+    auth = AuthConfig.load(dir_)
+
+    def runner(task, progress, flag):
+        grant = GRANT.get()
+        (add,) = apply_grant([_tool("add_fact", lambda a: '{"id": 296, "new": false}')], grant)
+        add.fn({"statement": "llama.cpp can use a draft model", "source": "https://a.example/doc"})
+        return RunOutcome(answer="Successfully stored fact 296.", stop_reason="final_answer")
+
+    spec = knowledge_spec(tmp_path)
+    app = build_app(spec, runner, auth=auth)
+    token = sign_attestation(
+        auth.signing_key("verifier"),
+        "verifier",
+        agent="Verifier",
+        task="t",
+        caller="orchestrator",
+        input="check",
+        answer=VERDICT,
+    )
+    mounts = {spec.url: httpx.ASGITransport(app=app)}
+    headers = auth_headers(dir_, "orchestrator")
+    async with httpx.AsyncClient(mounts=mounts, headers=headers, timeout=20) as http:
+        card = await discover(spec.url, http)
+        run = await ask(
+            card,
+            "store it",
+            http,
+            metadata={"skill": "knowledge_write", "attestations": [token]},
+        )
+    assert run.state == "completed"
+    assert "Write record (from the tool results):" in run.answer
+    assert "id 296: already stored, not added again" in run.answer
+
+
+async def test_the_final_answer_ends_with_the_write_record(tmp_path):
+    """The summary model says "stored"; the orchestrator appends the code-built record."""
+    m = Mesh(tmp_path)
+    record = "Stored it.\n\nWrite record (from the tool results):\n- id 296: already stored, x"
+    knowledge = knowledge_spec(tmp_path)
+    m.mounts[knowledge.url] = httpx.ASGITransport(
+        app=build_app(knowledge, done(record), auth=AuthConfig.load(m.dir))
+    )
+    async with m.client("orchestrator") as http:
+        cards, _ = await discover_all(m.urls, http)
+        out = await orchestrate(
+            "research and store",
+            cards,
+            ScriptedChat(
+                plan(
+                    ("s1", "web_research", []),
+                    ("s2", "claim_verification", ["s1"]),
+                    ("s3", "knowledge_write", ["s2"]),
+                ),
+                "The fact was stored.",
+            ),
+            http,
+            policy=RunPolicy(retries=0, backoff=0),
+            allow_writes=True,
+        )
+    assert out.state == "completed", out.message
+    assert out.answer.startswith("The fact was stored.")
+    assert out.answer.endswith(
+        "Write record (from the tool results):\ns3 (Knowledge):\n- id 296: already stored, x"
+    )
 
 
 def test_a_failed_write_does_not_use_up_the_claim():

@@ -175,6 +175,15 @@ uv run agentmesh orchestrate "Research local LLM inference and update my knowled
   `add_fact` call must cite a source URL that a signed verdict marked SUPPORTED, at most
   once per supported claim; anything else comes back to the model as an error.
   `knowledge_lookup` gets no write tool at all.
+- **What was really stored:** `add_fact` returns `"new": false` for a fact that was
+  already stored, and small models still reported those as "successfully stored". Now
+  the gate tells the model `ALREADY STORED` in words, and Knowledge's answer ends with a
+  write record built from the tool results (`id 314: already stored, not added again`).
+  The orchestrator appends every step's record to the final answer, so it holds even
+  when a summary gets it wrong. Live, storing the same fact again 4 times gave the right
+  record each time; with the matching summary rule, 3 of 3 summaries said so too.
+  Duplicates are still matched on exact (normalised) text, so a reworded fact is stored
+  as new.
 
 | Who asks Knowledge to write | Result |
 |---|---|
@@ -343,6 +352,22 @@ step searched Ollama and Qwen3-8B separately), the license task 3/3 (37-58 s; on
 since both values are about the same model), and the other four research tasks and the
 KV cache once each, all passed with no unfetched citations. Research still ended all
 three ratio steps with the task's `RATIO:` line, but the final answers were right.
+
+That `RATIO:` line is now taken out in code. The planner copies the task's reply format
+into a new `"format"` field (checked to be word for word from the task), and every step's
+answer loses the lines that start with that format's label (`RATIO:`, `FALSE:`) before a
+later step or the final reply reads it; the journal records each line dropped. Two
+versions that didn't work: removing the format from the task the steps see (the ratio
+task 0/3, because without "RATIO" the Analyst gave 0.125 as "the ratio" and the final
+reply used it; the claim check also fell to 0/3), and putting `"format"` first in the
+plan (the planner then wrote "Compute the ratio of A to B" instead of the task's "How
+many A fit in B", 0/3). With `"format"` last, two rounds of the ratio task and the claim
+check passed **12/12**, and the five research tasks, the KV cache and the lecture
+speed-up passed once each. In the final round, Research's `RATIO: 8` and the Verifier's
+`FALSE: 2` were dropped in all 6 runs, and nothing else was. (An earlier round also
+dropped the Analyst's "- Ratio: 4096 / 32768 = 0.125" line from its list of numbers, so
+the match is now case-sensitive; in one plan the planner copied only `RATIO: <number>`,
+which is now recognised too.)
 
 ## Development
 

@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from test_m3 import Fleet, ScriptedChat, answers, plan, step
 
@@ -20,8 +22,11 @@ from agentmesh.orchestrator import (
     cannot_reason,
     describe_catalogue,
     discover_all,
+    drop_format_lines,
+    format_lead,
     orchestrate,
     parse_plan,
+    plan_format,
     plan_inputs,
     plan_schema,
     without_writes,
@@ -312,14 +317,84 @@ async def test_other_failures_do_not_replan(tmp_path):
 
 
 def test_plan_schema_asks_for_inputs_before_steps():
-    # Constrained decoding writes properties in schema order, so "inputs" must come first:
-    # live, listing the values first is what made the KV-cache plan ask for the context
-    # length in its first step instead of after a CANNOT and a re-plan.
+    # Constrained decoding writes properties in schema order, so "inputs" must come before
+    # "steps": live, listing the values first is what made the KV-cache plan ask for the
+    # context length in its first step instead of after a CANNOT and a re-plan. "format"
+    # comes last: written first, it changed how the planner worded the steps.
     schema = plan_schema(["web_research"])
-    assert list(schema["properties"]) == ["inputs", "steps"]
-    assert schema["required"] == ["inputs", "steps"]
+    assert list(schema["properties"]) == ["inputs", "steps", "format"]
+    assert schema["required"] == ["inputs", "steps", "format"]
     item = schema["properties"]["inputs"]["items"]
     assert item["required"] == ["value", "source"]
+
+
+# --- the steps never see the task's reply format --------------------------------------
+
+RATIO_TASK = (
+    "Find Ollama's default context window and Qwen3-8B's native context length. How many\n"
+    'windows fit? End with\none line "RATIO: <number>".'
+)
+RATIO_FORMAT = 'End with one line "RATIO: <number>".'
+
+
+def test_format_lead_and_dropping_the_format_lines():
+    assert format_lead(RATIO_FORMAT) == "RATIO:"
+    assert format_lead('End your reply with one line "FALSE: <numbers>" listing ...') == "FALSE:"
+    assert format_lead("Answer in one sentence.") == format_lead("") == ""
+    assert format_lead('End with "<number>".') == ""  # nothing fixed to recognise
+    # Live, the planner sometimes copied only the template, or a non-template instruction.
+    assert format_lead("RATIO: <number>") == "RATIO:"
+    assert format_lead("Cite the pages you used.") == ""
+    answer = "Ollama: 4096. Qwen3-8B: 32768.\n\n**RATIO: 0.25**\n\nSources: x"
+    assert drop_format_lines(answer, RATIO_FORMAT) == (
+        "Ollama: 4096. Qwen3-8B: 32768.\n\nSources: x",
+        ["**RATIO: 0.25**"],
+    )
+    assert drop_format_lines("The ratio is 8.", RATIO_FORMAT) == ("The ratio is 8.", [])
+    numbers = "Numbers:\n- Ratio: 4096 / 32768 = 0.125\n- Fit: 8"
+    assert drop_format_lines(numbers, RATIO_FORMAT) == (numbers, [])
+    assert drop_format_lines(answer, "") == (answer, [])
+    assert plan_format('{"format": " x ", "steps": []}') == "x"
+    assert plan_format('{"steps": []}') == plan_format("not json") == ""
+
+
+async def test_step_answers_lose_the_format_line_and_steps_still_see_the_task(tmp_path):
+    # Live, a prompt rule telling steps to ignore the format didn't hold: Research ended
+    # its own answers with the task's "RATIO:" line, once as "RATIO: 0.25". Taking the
+    # format out of the task the steps see broke it the other way: without "RATIO:", the
+    # Analyst labelled 0.125 the ratio and the final reply used it (0/3).
+    fleet = Fleet(
+        tmp_path,
+        {
+            "Research": (9001, "web_research", answers("4096 and 32768\nRATIO: 0.25")),
+            "Analyst": (9002, "calculate", answers("8")),
+        },
+    )
+    reply = json.loads(
+        plan(
+            step("s1", "web_research", "Find both values."),
+            step("s2", "calculate", "How many fit: {{s1}}", ["s1"]),
+        )
+    )
+    chat = ScriptedChat(json.dumps({"format": RATIO_FORMAT, **reply}), "8 fit.\nRATIO: 8")
+    out = await orchestrate(RATIO_TASK, await cards_of(fleet), chat, fleet.http, policy=NO_WAIT)
+    assert out.state == "completed", out.message
+    assert out.results["s1"].answer == "4096 and 32768"
+    [analyst_got] = fleet.received["Analyst"]
+    assert analyst_got.startswith("How many fit: 4096 and 32768\n")
+    assert "0.25" not in analyst_got and "0.25" not in chat.calls[1][0][-1]["content"]
+    assert RATIO_TASK in analyst_got  # the steps still see the whole task, format included
+
+
+def test_the_format_must_come_from_the_task():
+    content = json.dumps(
+        {"format": 'End with "RATIO: x".', **json.loads(plan(step("s1", "web_research", "x")))}
+    )
+    with pytest.raises(PlanError, match="copied word for word"):
+        parse_plan(content, {"web_research": [object()]}, task=RATIO_TASK)
+    # The task's own wording passes, however it is wrapped.
+    content = json.dumps({**json.loads(content), "format": RATIO_FORMAT})
+    assert parse_plan(content, {"web_research": [object()]}, task=RATIO_TASK)
 
 
 def test_plan_inputs_reads_the_list_and_tolerates_its_absence():

@@ -46,6 +46,7 @@ from typing import Any
 import httpx
 from a2a.types import AgentCard, StreamResponse
 
+from agentmesh.access import WRITE_RECORD_HEADER
 from agentmesh.client import PushReceiver, TaskRun, ask, ask_push, cancel, discover
 from agentmesh.journal import JOURNAL_NAME, JsonlJournal
 
@@ -100,10 +101,15 @@ citations does not need one: the step that finds the facts cites its sources.
 - Anything written to a knowledge base must first go through a verification skill, and \
 only the claims it marks SUPPORTED may be stored, each with its source.
 
+- After the steps, in "format", copy word for word the part of the user's task that says \
+how the final reply must look (a line to end with, a template, a length), for example \
+'End with one line "TOTAL: <number>".', or "" when the task says nothing about it. Only \
+the final reply writes that line.
+
 Reply with JSON only: {"inputs": [{"value": "...", "source": "..."}, ...], "steps": \
-[{"id": "s1", "skill": "<skill id>", "input": "...", "depends_on": []}, ...]}, with ids \
-s1, s2, ... in the order the steps should start; "inputs" may be empty when nothing is \
-computed."""
+[{"id": "s1", "skill": "<skill id>", "input": "...", "depends_on": []}, ...], "format": \
+"..."}, with ids s1, s2, ... in the order the steps should start; "inputs" may be empty \
+when nothing is computed."""
 
 COMBINE_PROMPT = """\
 You write the final reply to a user's task from the results of a team of AI agents.
@@ -119,7 +125,9 @@ is the computed result.
 - Keep sources (URLs, lecture timestamps) next to the claims they support.
 - Say which steps failed or were skipped, and what that leaves undone.
 - Say that something was stored in the knowledge base only if a result says it was \
-stored, and list what was stored."""
+stored, and list what was stored. A result's "Write record" is what the tools really did: \
+a fact it marks "already stored" was a duplicate, so say it was already in the knowledge \
+base, not that it was stored now."""
 
 # Appended to every step's input (see ``step_input``): the user's task, so a step isn't
 # limited to the planner's rewording of it, and a way to fail instead of "completing" with
@@ -315,8 +323,10 @@ class Step:
 
 
 def plan_schema(skill_ids: list[str]) -> dict[str, Any]:
-    # "inputs" comes first: constrained decoding writes properties in schema order, so the
-    # planner names every value the answer depends on before it writes the steps.
+    # Constrained decoding writes properties in schema order: the planner names every value
+    # the answer depends on ("inputs") before it writes the steps, and only then copies the
+    # task's reply format ("format"). Format first made the planner write "Compute the
+    # ratio of A to B" instead of the task's "How many A fit in B" (0/3 on the ratio task).
     return {
         "type": "object",
         "properties": {
@@ -346,9 +356,64 @@ def plan_schema(skill_ids: list[str]) -> dict[str, Any]:
                     "required": ["id", "skill", "input", "depends_on"],
                 },
             },
+            "format": {"type": "string"},
         },
-        "required": ["inputs", "steps"],
+        "required": ["inputs", "steps", "format"],
     }
+
+
+def _span(text: str) -> re.Pattern[str] | None:
+    """A pattern matching ``text`` word for word, ignoring case and spacing (the task may
+    be wrapped differently from the planner's copy)."""
+    words = text.split()
+    return re.compile(r"\s+".join(map(re.escape, words)), re.I) if words else None
+
+
+def plan_format(content: str) -> str:
+    """The planner's "format": the part of the task that says how the final reply must
+    look, or "" (also for a plan without one)."""
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return ""
+    raw = data.get("format") if isinstance(data, dict) else None
+    return raw.strip() if isinstance(raw, str) else ""
+
+
+# The quoted template in a format instruction: End with one line "RATIO: <number>".
+_TEMPLATE = re.compile(r"[\"\u201c'`]([^\"\u201d'`]+)[\"\u201d'`]")
+
+
+def format_lead(fmt: str) -> str:
+    """The fixed label a reply-format line starts with ("RATIO:" for 'End with one line
+    "RATIO: <number>".', or for a bare 'RATIO: <number>'), or "" when the format has no
+    "LABEL: <...>" template to recognise (for example "Cite the pages you used.")."""
+    m = _TEMPLATE.search(fmt)
+    template = m.group(1) if m else fmt
+    lead = re.split(r"[<{\[]", template, maxsplit=1)[0].strip()
+    return lead if re.fullmatch(r"[A-Za-z][\w ()/-]{0,39}:", lead) else ""
+
+
+def drop_format_lines(answer: str, fmt: str) -> tuple[str, list[str]]:
+    """A step's answer without the lines that fill in the task's reply format, and the
+    lines dropped.
+
+    Steps see the whole task, format included: the format can say what is being asked
+    ("RATIO: <number>" after "How many ... fit" names the 8, not 0.125; without it the final
+    reply wrote "RATIO: 0.125" in 3 of 3 runs). But a prompt rule telling steps not to
+    follow it didn't hold: Research kept ending its own answer with a "RATIO:" line (once
+    "RATIO: 0.25", which the final reply kept). Only the final reply may write that line, so
+    it is taken out of every step's answer before anything else reads it."""
+    lead = format_lead(fmt)
+    if not lead:
+        return answer, []
+    # Case-sensitive: live, a case-insensitive match also took "- Ratio: 4096 / 32768 =
+    # 0.125" out of the Analyst's list of numbers, which is content, not the format line.
+    line = re.compile(r"^[ \t>*_`#-]*" + re.escape(lead) + r".*$", re.MULTILINE)
+    dropped = [m.group(0).strip() for m in line.finditer(answer)]
+    if not dropped:
+        return answer, []
+    return re.sub(r"\n{3,}", "\n\n", line.sub("", answer)).strip(), dropped
 
 
 def plan_inputs(content: str) -> list[dict[str, str]]:
@@ -391,6 +456,12 @@ def parse_plan(
         raise PlanError('the plan needs a non-empty "steps" list')
     if len(raw) > MAX_STEPS:
         raise PlanError(f"the plan has {len(raw)} steps; the limit is {MAX_STEPS}")
+    fmt = _span(plan_format(content))
+    if fmt is not None and task and not fmt.search(task):
+        raise PlanError(
+            '"format" must be copied word for word from the user\'s task, or be "" when '
+            "the task says nothing about how the reply must look"
+        )
 
     steps: list[Step] = []
     for n, item in enumerate(raw, 1):
@@ -792,6 +863,7 @@ async def _run_one(
     rec: Recorder,
     policy: RunPolicy,
     task: str = "",
+    fmt: str = "",
 ) -> None:
     """Runs one step to a terminal state. Never raises (except when cancelled): failures,
     retries and fallbacks go into the result."""
@@ -818,11 +890,18 @@ async def _run_one(
             if run is not None:
                 a.task_id = run.task_id or a.task_id
                 a.state, a.message = run.state or "failed", run.final_message
-                r.answer, r.stats = run.answer, run.stats
+                answer, dropped = drop_format_lines(run.answer, fmt)
+                if dropped:
+                    rec.state(
+                        "working",
+                        message=f"{step.id}: dropped the reply-format line(s) "
+                        f"{dropped} from {a.agent}'s answer; only the final reply writes them",
+                    )
+                r.answer, r.stats = answer, run.stats
                 r.attestation = run.attestation
-                if a.state == "completed" and not run.answer.strip():
+                if a.state == "completed" and not answer.strip():
                     a.state, a.message = "failed", "the agent completed with an empty answer"
-                elif a.state == "completed" and (why := cannot_reason(run.answer)):
+                elif a.state == "completed" and (why := cannot_reason(answer)):
                     # An agent that says it couldn't do its part has failed the step, even
                     # though its A2A task completed; without this, M4's retries and
                     # fallback never fire and the next step gets an apology as its input.
@@ -882,8 +961,10 @@ async def run_steps(
     policy: RunPolicy | float,
     task: str = "",
     done: dict[str, StepResult] | None = None,
+    fmt: str = "",
 ) -> dict[str, StepResult]:
-    """Runs the plan. With ``task`` (the user's task), every step also receives it.
+    """Runs the plan. With ``task`` (the user's task), every step also receives it; with
+    ``fmt`` (the task's reply format), lines filling it in are dropped from step answers.
 
     ``done`` holds completed steps from an earlier plan (a re-plan): the new steps can
     depend on them, and they are returned with the new results."""
@@ -917,7 +998,7 @@ async def run_steps(
                     del waiting[sid]
                     running.add(
                         asyncio.ensure_future(
-                            _run_one(s, results, catalogue, http, rec, policy, task)
+                            _run_one(s, results, catalogue, http, rec, policy, task, fmt)
                         )
                     )
         if not running:
@@ -968,6 +1049,21 @@ async def combine(
         },
     ]
     return await chat(messages, None)
+
+
+def write_records(plan: list[Step], results: dict[str, StepResult]) -> str:
+    """Every completed step's write record (see ``access.Grant.write_report``), in plan
+    order, as one block for the end of the final answer. Empty when no step wrote."""
+    blocks = []
+    for s in plan:
+        r = results.get(s.id)
+        if r is None or not r.ok or WRITE_RECORD_HEADER not in r.answer:
+            continue
+        lines = r.answer.split(WRITE_RECORD_HEADER, 1)[1].strip().splitlines()
+        items = [ln for ln in lines if ln.startswith("- ")]
+        if items:
+            blocks.append(f"{s.id} ({r.agent or s.skill}):\n" + "\n".join(items))
+    return f"{WRITE_RECORD_HEADER}\n" + "\n".join(blocks) if blocks else ""
 
 
 @dataclass
@@ -1093,6 +1189,7 @@ async def _orchestrate(
         step=1,
         content=json.dumps(
             {
+                "format": plan_format(attempts[-1]["content"]),
                 "inputs": plan_inputs(attempts[-1]["content"]),
                 "steps": [s.to_dict() for s in out.plan],
             },
@@ -1119,11 +1216,14 @@ async def _orchestrate(
         for s in out.plan
     )
     rec.state("working", message=f"plan: {summary}")
+    fmt = plan_format(attempts[-1]["content"])
+    if format_lead(fmt):
+        rec.state("working", message=f"reply format, kept out of step answers: {fmt}")
     if plan_only:
-        out.answer = json.dumps({"steps": [s.to_dict() for s in out.plan]}, indent=2)
+        out.answer = json.dumps({"format": fmt, "steps": [s.to_dict() for s in out.plan]}, indent=2)
         return finish("completed")
 
-    out.results = await run_steps(out.plan, catalogue, http, rec, policy, task)
+    out.results = await run_steps(out.plan, catalogue, http, rec, policy, task, fmt=fmt)
     model_step = 1
     for _ in range(max(0, policy.replans)):
         stuck = [r for r in out.results.values() if r.state == "failed" and r.cannot]
@@ -1173,7 +1273,9 @@ async def _orchestrate(
         rec.state("working", message="re-plan: " + "; ".join(f"{s.id} {s.skill}" for s in new))
         out.plan = [*out.plan, *new]
         kept = {sid: r for sid, r in out.results.items() if r.ok}
-        out.results.update(await run_steps(new, catalogue, http, rec, policy, task, done=kept))
+        out.results.update(
+            await run_steps(new, catalogue, http, rec, policy, task, done=kept, fmt=fmt)
+        )
 
     rec.state("working", message="combining the results")
     try:
@@ -1181,6 +1283,10 @@ async def _orchestrate(
     except Exception as exc:
         return finish("failed", f"combining failed: {type(exc).__name__}: {exc}", stop="error")
     out.answer = reply.content.strip()
+    if records := write_records(out.plan, out.results):
+        # Built by the Knowledge agent's code from add_fact's results, so the user sees
+        # what was really stored even when the summary calls a duplicate "stored".
+        out.answer = f"{out.answer}\n\n{records}"
     out.tokens["prompt"] += reply.prompt_tokens
     out.tokens["completion"] += reply.completion_tokens
     rec.event(

@@ -395,7 +395,22 @@ async def test_cancelling_the_orchestration_cancels_the_remote_task(tmp_path):
             policy=RunPolicy(step_timeout=30, push=fleet.receiver),
         )
     )
-    await until(lambda: "working" in _states(fleet.journals["Slow"]))
+    # Wait for the orchestrator to know the remote task id, not just for the agent to start:
+    # a cancel between the two has no id to send, so the remote run would go on (a gap of
+    # milliseconds, but the test hit it under load).
+    await until(
+        lambda: (
+            any(
+                "took it as task" in (json.loads(x).get("message") or "")
+                for x in (root / "orchestrator" / JOURNAL_NAME)
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if x
+            )
+            if (root / "orchestrator" / JOURNAL_NAME).exists()
+            else False
+        )
+    )
     job.cancel()
     with pytest.raises(asyncio.CancelledError):
         await job

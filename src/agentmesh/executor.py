@@ -213,6 +213,8 @@ class AgentOSExecutor(AgentExecutor):
             self._cancel_flags.pop(task.id, None)
 
         if outcome.ok:
+            if grant is not None and (report_text := grant.write_report()):
+                outcome.answer = f"{outcome.answer.rstrip()}\n\n{report_text}"
             await updater.add_artifact(
                 [Part(text=outcome.answer)], name="result", metadata=outcome.stats()
             )

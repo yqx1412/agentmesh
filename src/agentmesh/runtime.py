@@ -19,7 +19,7 @@ from agentos.mcp_client import MCPManager
 from agentos.sandbox import sandbox_tools
 from agentos.tools import Policy, Tool, ToolError, ToolRegistry
 
-from agentmesh.access import GRANT, Grant
+from agentmesh.access import GRANT, Grant, read_write_result
 from agentmesh.executor import TASK_ID, Cancelled, Progress, Runner, RunOutcome
 from agentmesh.spec import SANDBOX_TOOLS, AgentSpec
 
@@ -203,10 +203,20 @@ def _attested(tool: Tool, grant: Grant):
         if why is not None:
             raise ToolError(why)
         try:
-            return inner(args)
+            result = inner(args)
         except Exception:
             grant.refund(url)  # a failed write doesn't use up the claim
             raise
+        rec = read_write_result(args, result)
+        grant.record(rec)
+        if rec.new is False:
+            # Say it in words: small models read {"new": false} as "stored".
+            note = (
+                f"ALREADY STORED: this fact was already in the knowledge base (id {rec.id}); "
+                "nothing new was added. Report it as a duplicate, not as stored.\n"
+            )
+            return note + result if isinstance(result, str) else {"note": note, **result}
+        return result
 
     return call
 

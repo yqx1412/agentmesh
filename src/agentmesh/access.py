@@ -38,6 +38,9 @@ from agentmesh.spec import AgentSpec, SkillSpec
 # Most signed results one request may carry.
 MAX_ATTESTATIONS = 8
 
+# Heads the code-built list of a task's writes at the end of its answer.
+WRITE_RECORD_HEADER = "Write record (from the tool results):"
+
 
 class Refused(Exception):
     """The caller may not do this; the message says why, and is shown to the caller."""
@@ -67,6 +70,39 @@ def source_of(args: Any) -> str:
 
 
 @dataclass
+class WriteRecord:
+    """One attested write: the statement, and the id and ``new`` flag the tool returned
+    (``new`` is False for a duplicate, None when the result couldn't be read)."""
+
+    statement: str
+    id: int | None = None
+    new: bool | None = None
+
+
+def read_write_result(args: Any, result: Any) -> WriteRecord:
+    """Build a ``WriteRecord`` from an add_fact-style call and its result (a dict, or the
+    JSON text an MCP tool returns)."""
+    if hasattr(args, "model_dump"):
+        args = args.model_dump()
+    statement = ""
+    if isinstance(args, dict):
+        statement = str(args.get("statement") or args.get("text") or "")
+    data = result
+    if isinstance(result, str):
+        try:
+            data = json.loads(result)
+        except json.JSONDecodeError:
+            data = None
+    rec = WriteRecord(" ".join(statement.split()))
+    if isinstance(data, dict):
+        if isinstance(data.get("id"), int):
+            rec.id = data["id"]
+        if isinstance(data.get("new"), bool):
+            rec.new = data["new"]
+    return rec
+
+
+@dataclass
 class Grant:
     """What one admitted task may do."""
 
@@ -77,7 +113,28 @@ class Grant:
     # Remaining uses per supported source URL (normalised).
     budget: Counter[str] = field(default_factory=Counter)
     signed: list[str] = field(default_factory=list)  # the signed tasks' ids
+    # One entry per attested write that went through: what the tool said it did.
+    writes: list[WriteRecord] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def record(self, entry: WriteRecord) -> None:
+        with self._lock:
+            self.writes.append(entry)
+
+    def write_report(self) -> str:
+        """The task's writes as the tools reported them, for the end of the answer. The
+        model's own wording can call a duplicate "stored"; this list is built from the
+        tool results, so it can't."""
+        if not self.writes:
+            return ""
+        lines = [WRITE_RECORD_HEADER]
+        for w in self.writes:
+            ident = f"id {w.id}" if w.id is not None else "no id"
+            what = "stored as new" if w.new else "already stored, not added again"
+            if w.new is None:
+                what = "result unclear"
+            lines.append(f"- {ident}: {what}: {w.statement[:200]}")
+        return "\n".join(lines)
 
     def allows_tool(self, name: str) -> bool:
         return self.tools is None or any(tool_matches(name, t) for t in self.tools)

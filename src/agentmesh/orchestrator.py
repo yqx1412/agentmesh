@@ -91,6 +91,12 @@ step's full answer, and the step then runs after it.
 - Steps that don't depend on each other run at the same time.
 - Use as few steps as the task needs, at most 6. Include every skill the task actually \
 needs and no others.
+- Give each skill one step that asks for everything the task needs from it, for example \
+"Find the license and the native context length of ...". A second step with the same skill \
+is allowed only when it needs an earlier step's result.
+- Add a verification step only when the user's task asks to check, verify or fact-check \
+something, or when the plan writes to a knowledge base. A task that asks for sources or \
+citations does not need one: the step that finds the facts cites its sources.
 - Anything written to a knowledge base must first go through a verification skill, and \
 only the claims it marks SUPPORTED may be stored, each with its source.
 
@@ -428,6 +434,7 @@ def parse_plan(
                 why = "did not complete" if d in taken else "is not a step in the plan"
                 raise PlanError(f"step {s.id} uses {d}, which {why}")
     _check_acyclic(steps, done)
+    _check_one_step_per_skill(steps)
     missing = sorted(redo - {s.skill for s in steps})
     if missing:
         raise PlanError(
@@ -436,6 +443,31 @@ def parse_plan(
             + " that gets the missing input"
         )
     return steps
+
+
+def _check_one_step_per_skill(steps: list[Step]) -> None:
+    """Two steps may share a skill only when one of them needs the other's result.
+
+    Independent steps on one skill each cost a full agent run (the M6 rerun's planner split
+    one Qwen3-8B lookup into two parallel Research steps); one step can ask for both."""
+    by_id = {s.id: s for s in steps}
+    upstream: dict[str, set[str]] = {}
+
+    def ancestors(sid: str) -> set[str]:
+        if sid not in upstream:
+            upstream[sid] = set()
+            for d in by_id[sid].depends_on:
+                if d in by_id:
+                    upstream[sid] |= {d} | ancestors(d)
+        return upstream[sid]
+
+    for i, a in enumerate(steps):
+        for b in steps[i + 1 :]:
+            if a.skill == b.skill and a.id not in ancestors(b.id) and b.id not in ancestors(a.id):
+                raise PlanError(
+                    f"{a.id} and {b.id} both use {a.skill} and neither needs the other's "
+                    f"result; ask for everything the task needs from {a.skill} in one step"
+                )
 
 
 def _check_acyclic(steps: list[Step], done: frozenset[str] = frozenset()) -> None:

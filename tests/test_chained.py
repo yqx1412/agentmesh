@@ -70,6 +70,9 @@ async def test_every_step_receives_the_users_task(tmp_path):
     # ended with the task's "RATIO:" line and the final answer kept it).
     assert "are for the final reply to the user, not for you" in context
     assert "it does not replace the rest of these rules" in chat.calls[1][0][0]["content"]
+    # A task that only asks for citations gets no verification step (the M6 rerun's
+    # planner added one to every r-qwen-license lookup).
+    assert "does not need one: the step that finds" in chat.calls[0][0][0]["content"]
 
 
 # --- 2. "I couldn't" fails the step ----------------------------------------------------
@@ -359,3 +362,42 @@ def test_names_values_without_a_formula_and_a_formula_from_the_task_pass():
     )
     # Markdown bold is not multiplication.
     assert parse_plan(_one_step("Compute the **KV-cache** size."), cat, task="t")
+
+
+def test_two_independent_steps_may_not_share_a_skill():
+    # The M6 rerun's license lookup became two parallel Research steps, one per question,
+    # each a full agent run; one step can ask for both.
+    cat = {"web_research": [object()], "calculate": [object()]}
+    split = plan(
+        step("s1", "web_research", "Find the license."),
+        step("s2", "web_research", "Find the native context length."),
+    )
+    with pytest.raises(PlanError, match="s1 and s2 both use web_research"):
+        parse_plan(split, cat)
+    # Also when a later step joins them: s2 still doesn't need s1.
+    joined = plan(
+        step("s1", "web_research", "Find the license."),
+        step("s2", "web_research", "Find the native context length."),
+        step("s3", "calculate", "Use {{s1}} and {{s2}}.", ["s1", "s2"]),
+    )
+    with pytest.raises(PlanError, match="neither needs the other's result"):
+        parse_plan(joined, cat)
+
+
+def test_a_skill_may_repeat_when_one_step_needs_the_others_result():
+    cat = {"web_research": [object()], "calculate": [object()]}
+    direct = plan(
+        step("s1", "web_research", "Which model does the page recommend?"),
+        step("s2", "web_research", "Find the license of {{s1}}.", ["s1"]),
+    )
+    assert [s.id for s in parse_plan(direct, cat)] == ["s1", "s2"]
+    # Through another step counts too.
+    chained = plan(
+        step("s1", "web_research", "Find the model's size."),
+        step("s2", "calculate", "Pick a GPU for {{s1}}.", ["s1"]),
+        step("s3", "web_research", "Find the price of {{s2}}.", ["s2"]),
+    )
+    assert len(parse_plan(chained, cat)) == 3
+    # A re-plan's new step may reuse a skill an earlier (done) step used.
+    replan = plan(step("s3", "web_research", "Find the context length."))
+    assert parse_plan(replan, cat, done=frozenset({"s1"}), taken=frozenset({"s1", "s2"}))

@@ -317,6 +317,33 @@ Qwen3-8B license lookup: the fetched text of the model card doesn't contain the 
 and Research, now told to cite only fetched pages, said so. The prompt rules were tuned
 on these same composite tasks, so 9/9 overstates the fleet on new chained tasks.
 
+After the rerun, three more fixes.
+The planner is now told to add a verification step only when the task asks to check or
+verify something, or before a knowledge-base write; asking for citations doesn't need one
+(the M6 rerun's planner added one to every Qwen3-8B license lookup). In 3 planner-only
+passes over all 16 tasks, no lookup got a verification step, the claim-check task kept
+its own, and "research ... and update my knowledge base" with `--allow-writes` still went
+Research -> Verifier -> Knowledge. The license plan now asks two Research steps in
+parallel, one per question. Live: the license task 4/4 (47-56 s, was a 67 s median),
+and the other research tasks and the claim check 5/5.
+The planner is now told to give each skill one step that asks for everything the task
+needs from it, and `parse_plan` sends back a plan where two steps share a skill and
+neither needs the other's result. In 3 planner-only passes over the 16 tasks every plan
+had one step per skill (the check never had to fire): the license lookup, the
+context-window ratio and the lecture speed-up each lost a step. Live, 3 times each: all
+12 runs passed. The license task took 44-54 s and 27-44k tokens (was 47-56 s, 40-51k),
+the KV cache was unchanged, and the lecture speed-up took 87-101 s, a little slower. The
+ratio task got worse: in 2 of 3 runs the merged Research step ran one search for both
+values, fetched only Ollama pages and couldn't give Qwen3-8B's context length, so the
+Analyst replied `CANNOT` and the re-plan fetched it (219-226 s, was a 91 s median).
+Research is now told to search and fetch separately for each thing it is asked about,
+and to check every requested value has a fetched page behind it before answering.
+Rerun: the ratio task **3/3** with no re-plan (78-89 s, 21-22k tokens; every Research
+step searched Ollama and Qwen3-8B separately), the license task 3/3 (37-58 s; one search,
+since both values are about the same model), and the other four research tasks and the
+KV cache once each, all passed with no unfetched citations. Research still ended all
+three ratio steps with the task's `RATIO:` line, but the final answers were right.
+
 ## Development
 
 ```powershell

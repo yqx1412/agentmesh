@@ -82,7 +82,8 @@ value, given). Then make the step named as each value's source ask for that valu
 - Never write a formula, method or worked number into a step's input. Name what to \
 compute and the values to use; the agent that computes chooses the method.
 - Ask each step for exactly what the user's task asks, in the same direction: "A per B" \
-stays "A per B", never "B per A".
+stays "A per B", never "B per A". The step that computes the answer asks the task's \
+question word for word ("How many A fit in B?", never "the ratio of A to B").
 - Keep every qualifier the user's task puts on a value, word for word ("native context \
 length", "KV heads", "fp16"). Never swap one for a looser or different word ("maximum \
 context length", "attention heads"): to the agent it names a different value.
@@ -154,6 +155,9 @@ _CANNOT = re.compile(r"^[ \t>*_`-]*CANNOT[ \t]*:[ \t*_`]*(.*?)[ \t*_`]*$", re.MU
 # Card skills carrying this tag change state (the Knowledge agent's knowledge_write). The
 # planner only sees them when the run allows writes (``orchestrate(allow_writes=True)``).
 WRITE_TAG = "write"
+# Card skills carrying this tag compute (the Analyst's computation); a computing step that
+# produces the answer must keep the task's question (see ``_check_question_kept``).
+MATH_TAG = "math"
 
 WRITES_OFF = (
     "Writing was not enabled for this run, so no step could store anything (skills not "
@@ -506,6 +510,7 @@ def parse_plan(
                 raise PlanError(f"step {s.id} uses {d}, which {why}")
     _check_acyclic(steps, done)
     _check_one_step_per_skill(steps)
+    _check_question_kept(steps, task, catalogue)
     missing = sorted(redo - {s.skill for s in steps})
     if missing:
         raise PlanError(
@@ -514,6 +519,46 @@ def parse_plan(
             + " that gets the missing input"
         )
     return steps
+
+
+def _words(text: str) -> list[str]:
+    """Lowercase words, with {{sN}} references and any brackets holding them removed."""
+    text = re.sub(r"\(\s*\{\{\s*s\d+\s*\}\}\s*\)|\{\{\s*s\d+\s*\}\}", " ", text)
+    return re.findall(r"[\w']+", text.lower().replace("\u2019", "'"))
+
+
+def _in_order(needle: list[str], hay: list[str]) -> bool:
+    it = iter(hay)
+    return all(w in it for w in needle)
+
+
+def _check_question_kept(steps: list[Step], task: str, catalogue: Catalogue) -> None:
+    """A computing step (a skill its card tags ``math``) that turns earlier steps' results
+    into the answer must ask the task's question in the task's words (other words may be
+    added between them, and {{sN}} references).
+
+    Live, the planner turned "How many of A fit in B?" into "Compute the ratio of A to B"
+    in most runs; the Analyst then correctly gave A/B = 0.125 instead of 8. Only a task
+    with exactly one question ("?") is checked, and only computing steps that use another
+    step's result and that no step uses (the ones that produce the answer)."""
+    one = " ".join(task.split())  # a question may be wrapped over lines
+    questions = [q.strip() for q in re.findall(r"[^.?!]*\?", one) if q.strip()]
+    if len(questions) != 1:
+        return
+    want = _words(questions[0])
+    used = {d for s in steps for d in s.depends_on}
+
+    def computes(s: Step) -> bool:
+        return any(MATH_TAG in (getattr(k, "tags", None) or []) for k in catalogue[s.skill])
+
+    finals = [s for s in steps if s.depends_on and s.id not in used and computes(s)]
+    if finals and not any(_in_order(want, _words(s.input)) for s in finals):
+        ids = ", ".join(s.id for s in finals)
+        raise PlanError(
+            f"step {ids} computes the answer, so its input must ask the user's question in "
+            f'the user\'s own words: "{questions[0]}" (add the values to use around it, or '
+            "{{sN}} references, but do not reword the question)"
+        )
 
 
 def _check_one_step_per_skill(steps: list[Step]) -> None:

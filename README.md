@@ -369,6 +369,26 @@ dropped the Analyst's "- Ratio: 4096 / 32768 = 0.125" line from its list of numb
 the match is now case-sensitive; in one plan the planner copied only `RATIO: <number>`,
 which is now recognised too.)
 
+**The answering step keeps the task's question.** The full rerun after the fix above
+(on `62867a9`) dropped the ratio task to 0/3, and a recheck to 1/3: the planner still
+rewrote "How many of A fit in B?" as "Compute the ratio of A to B" in most runs, and the
+Analyst correctly answered 0.125. The earlier 12/12 had been luck. Now `parse_plan`
+sends a plan back when a computing step (a skill tagged `math`) that turns earlier
+results into the answer doesn't ask the task's one question in its words, in order
+(`{{sN}}` references and other words may sit between them); the planner prompt says so
+too. Composite tasks, fleet only, **10 runs each**:
+
+| Task | Passed | Median |
+|---|---|---|
+| Qwen3-8B KV cache | 8/10 | 122 s |
+| Context-window ratio | 8/10 | 75 s |
+| Lecture speed-up | 10/10 | 87 s |
+
+All 10 ratio plans kept the question. Its 2 failures were the final summary replying
+only `RATIO: 8.0`, dropping the two values the task asked to look up. The KV failures
+were Research's lookups: a head dimension of 8, and `config.json`'s 40,960 used as the
+native context length.
+
 ## Development
 
 ```powershell

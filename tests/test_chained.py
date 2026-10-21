@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from test_m3 import Fleet, ScriptedChat, answers, plan, step
@@ -373,7 +374,7 @@ async def test_step_answers_lose_the_format_line_and_steps_still_see_the_task(tm
     reply = json.loads(
         plan(
             step("s1", "web_research", "Find both values."),
-            step("s2", "calculate", "How many fit: {{s1}}", ["s1"]),
+            step("s2", "calculate", "How many windows fit: {{s1}}", ["s1"]),
         )
     )
     chat = ScriptedChat(json.dumps({"format": RATIO_FORMAT, **reply}), "8 fit.\nRATIO: 8")
@@ -381,7 +382,7 @@ async def test_step_answers_lose_the_format_line_and_steps_still_see_the_task(tm
     assert out.state == "completed", out.message
     assert out.results["s1"].answer == "4096 and 32768"
     [analyst_got] = fleet.received["Analyst"]
-    assert analyst_got.startswith("How many fit: 4096 and 32768\n")
+    assert analyst_got.startswith("How many windows fit: 4096 and 32768\n")
     assert "0.25" not in analyst_got and "0.25" not in chat.calls[1][0][-1]["content"]
     assert RATIO_TASK in analyst_got  # the steps still see the whole task, format included
 
@@ -437,6 +438,54 @@ def test_names_values_without_a_formula_and_a_formula_from_the_task_pass():
     )
     # Markdown bold is not multiplication.
     assert parse_plan(_one_step("Compute the **KV-cache** size."), cat, task="t")
+
+
+REAL_RATIO = (
+    "Find Ollama's default context window size in tokens in its documentation, for a GPU "
+    "with less than 24 GiB of VRAM, and Qwen3-8B's native context length in its model card. "
+    "How many of Ollama's default windows fit in Qwen3-8B's native context? End with one "
+    'line "RATIO: <number>".'
+)
+CAT2 = {"web_research": [object()], "calculate": [SimpleNamespace(tags=["math"])]}
+
+
+def _lookup_then(text: str) -> str:
+    return plan(step("s1", "web_research", "Find both values."), step("s2", "calculate", text))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The full M6 rerun's three failures (and two of the three rechecks).
+        "Compute the ratio of Ollama's default context window size ({{s1}}) to Qwen3-8B's "
+        "native context length ({{s1}}).",
+        "How many windows fit? Use {{s1}}.",  # words dropped
+        "How many of Qwen3-8B's native contexts fit in Ollama's default window ({{s1}})?",
+    ],
+)
+def test_the_answering_step_must_keep_the_tasks_question(text):
+    with pytest.raises(PlanError, match="in the user's own words"):
+        parse_plan(_lookup_then(text), CAT2, task=REAL_RATIO)
+
+
+def test_the_tasks_question_with_references_and_values_added_passes():
+    ok = "How many of Ollama's default windows ({{s1}}) fit in Qwen3-8B's native context ({{s1}})?"
+    assert parse_plan(_lookup_then(ok), CAT2, task=REAL_RATIO)
+    extra = "Using {{s1}}: how many of Ollama's default windows fit in Qwen3-8B's native context?"
+    assert parse_plan(_lookup_then(extra), CAT2, task=REAL_RATIO)
+
+
+def test_the_question_check_only_applies_to_one_question_and_answering_steps():
+    reworded = _lookup_then("Compute the ratio of the two values in {{s1}}.")
+    # No question in the task, or two: nothing to hold the step to.
+    assert parse_plan(reworded, CAT2, task="Find A and B, then compute A over B.")
+    assert parse_plan(reworded, CAT2, task="What is A? What is B? Compute A over B.")
+    # A step that uses nothing (a single lookup) isn't held to it either.
+    single = plan(step("s1", "web_research", "Find the license and context length."))
+    assert parse_plan(single, CAT2, task="What license is Qwen3-8B under, and its context?")
+    # Nor is a step whose skill doesn't compute (a Verifier checking a lookup).
+    cat = {"web_research": [object()], "calculate": [SimpleNamespace(tags=["verification"])]}
+    assert parse_plan(reworded, cat, task=REAL_RATIO)
 
 
 def test_two_independent_steps_may_not_share_a_skill():

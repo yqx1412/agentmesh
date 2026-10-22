@@ -18,6 +18,7 @@ from agentmesh.runtime import (
     missing_calls,
     select_tools,
     system_prompt,
+    unfetched_numbers,
 )
 from agentmesh.spec import AgentSpec, SkillSpec, SpecError, load_spec
 from agentmesh.webtools import check_url, fetch_page, page_window
@@ -185,6 +186,94 @@ def test_quote_guard_off_by_default():
     assert AnswerGuardLLM(ScriptedLLM([fake])).chat([PAGE], []).message is fake
 
 
+CARD = tool_msg(
+    "web__fetch_url",
+    '{"url": "https://huggingface.co/Qwen/Qwen3-8B", "title": "Qwen3-8B", "text": '
+    '"- Number of Layers: 36\\n- Number of Attention Heads (GQA): 32 for Q and 8 for KV\\n'
+    '- Context Length: 32,768 natively and 131,072 tokens with YaRN.", "offset": 0}',
+)
+OLLAMA = tool_msg("web__fetch_url", '{"text": "- < 24 GiB VRAM: 4k context"}')
+TASK_MSG = Message(role="user", content="Find Qwen3-8B's values for a GPU under 24 GiB.")
+
+
+def test_unfetched_numbers():
+    msgs = [TASK_MSG, CARD, OLLAMA]
+    # Live, Research gave the head dimension as 5120, a number the card never states.
+    answer = "1. Layers: 36\n2. KV heads: 8\n3. Head dimension: 5120\n4. Context: 32768 tokens"
+    assert unfetched_numbers(answer, msgs, "fetch_url") == ["5120"]
+    # "4k" on a page states 4,096; the task's own numbers and 0-2 don't need a page;
+    # numbers in URLs and model names aren't values.
+    ok = "Ollama: 4,096 tokens below 24 GiB, 1 window, x2. See https://x.io/v3/123 (Qwen3-8B)"
+    assert unfetched_numbers(ok, msgs, "fetch_url") == []
+    # Search snippets are not pages, and nothing fetched yet means nothing to check.
+    snippet = tool_msg("web__web_search", '{"results": [{"snippet": "head_dim 5120"}]}')
+    assert unfetched_numbers("5120", [snippet, CARD], "fetch_url") == ["5120"]
+    assert unfetched_numbers("5120", [snippet], "fetch_url") == []
+    # A failed fetch's error may be quoted.
+    failed = tool_msg("web__fetch_url", "ERROR: HTTP 403 from https://x.io")
+    assert unfetched_numbers("The page gave HTTP 403.", [failed, CARD], "fetch_url") == []
+
+
+def test_number_guard_sends_unfetched_number_back():
+    bad = Message(role="assistant", content="Head dimension: 5120")
+    good = Message(role="assistant", content="The card gives no head dimension.")
+    inner = ScriptedLLM([bad, good])
+    resp = AnswerGuardLLM(inner, check_numbers="fetch_url").chat([TASK_MSG, CARD], [])
+    assert resp.message is good
+    assert "5120" in inner.seen[1][-1].content
+    assert "config.json" in inner.seen[1][-1].content
+    # Off unless the spec names the fetch tool.
+    assert AnswerGuardLLM(ScriptedLLM([bad])).chat([TASK_MSG, CARD], []).message is bad
+
+
+def test_research_checks_numbers():
+    assert load_spec(AGENTS / "research.toml").check_numbers == "fetch_url"
+
+
+def test_web_search_drops_empty_hits_ranks_model_pages_first(monkeypatch):
+    import sys
+    import types
+
+    from agentmesh import webtools
+
+    hits = [{"title": "", "href": "", "body": ""}]
+    asked = []
+
+    def text(q, max_results):
+        asked.append(max_results)
+        return hits
+
+    fake = types.SimpleNamespace(DDGS=lambda: types.SimpleNamespace(text=text))
+    monkeypatch.setitem(sys.modules, "ddgs", fake)
+    with pytest.raises(ToolError, match="no results"):
+        webtools.web_search("Ollama default context window")
+    hits.append({"title": "Ollama", "href": "https://docs.ollama.com/faq", "body": "4096"})
+    assert webtools.web_search("q", max_results=3)["results"] == [
+        {"title": "Ollama", "url": "https://docs.ollama.com/faq", "snippet": "4096"}
+    ]
+    webtools.web_search("q", max_results=50)
+    assert asked == [10, 10, 10]  # ten asked for, so a model page ranked 6-10 can move up
+    # At least 5 come back (3 often missed the model card), at most 10.
+    hits[:] = [{"title": str(i), "href": f"https://x.io/{i}", "body": ""} for i in range(12)]
+    assert len(webtools.web_search("q", max_results=3)["results"]) == 5
+    assert len(webtools.web_search("q", max_results=50)["results"]) == 10
+    # A model's own Hugging Face page goes first, even from 7th; the others keep their order.
+    hits[:] = [
+        {"title": "PDF", "href": "https://developer.nvidia.com/qwen3-8b.pdf", "body": ""},
+        {"title": "Specs", "href": "https://apxml.com/models/qwen3-8b", "body": ""},
+        *({"title": "x", "href": f"https://x.io/{i}", "body": ""} for i in range(4)),
+        {"title": "Card", "href": "https://huggingface.co/Qwen/Qwen3-8B", "body": ""},
+    ]
+    urls = [r["url"] for r in webtools.web_search("Qwen3-8B model card")["results"]]
+    assert urls == [
+        "https://huggingface.co/Qwen/Qwen3-8B",
+        "https://developer.nvidia.com/qwen3-8b.pdf",
+        "https://apxml.com/models/qwen3-8b",
+        "https://x.io/0",
+        "https://x.io/1",
+    ]
+
+
 # --- webtools ----------------------------------------------------------------------------
 
 
@@ -261,3 +350,61 @@ def test_guard_sends_empty_answer_back_even_with_no_rules():
     resp = AnswerGuardLLM(inner).chat([Message(role="user", content="q")], [])
     assert resp.message is ANSWER
     assert "reply was empty" in inner.seen[1][-1].content
+
+
+def test_hugging_face_model_page_and_config_json_come_together():
+    from agentmesh.webtools import Page, with_model_config
+
+    asked = []
+
+    def fetch(url):
+        asked.append(url)
+        return Page(url=url, title=None, text='{\n  "head_dim": 128\n}')
+
+    card = Page(url="https://huggingface.co/Qwen/Qwen3-8B", title="Qwen3-8B", text="Layers: 36")
+    out = with_model_config(card, fetch)
+    assert asked == ["https://huggingface.co/Qwen/Qwen3-8B/resolve/main/config.json"]
+    assert out.text.startswith(
+        "[This model's config.json, from https://huggingface.co/Qwen/Qwen3-8B/blob/main/config.json]"
+        "\n(max_position_embeddings is the longest position"
+    )
+    assert '"head_dim": 128' in out.text
+    assert out.text.endswith(
+        "[The model card, from https://huggingface.co/Qwen/Qwen3-8B]\nLayers: 36"
+    )
+    assert out.url == card.url
+
+    # A fetched config.json gets the card after it (live, Research fetched only config.json
+    # and took max_position_embeddings for the native context length). A blob URL is the
+    # rendered view, so the raw file is fetched at the same revision.
+    pages = {
+        "https://huggingface.co/Qwen/Qwen3-8B/resolve/b96882/config.json": '{"head_dim": 128}',
+        "https://huggingface.co/Qwen/Qwen3-8B": "Context Length: 32,768 natively",
+    }
+    asked.clear()
+
+    def by_url(url):
+        asked.append(url)
+        return Page(url=url, title=None, text=pages[url])
+
+    blob = "https://huggingface.co/Qwen/Qwen3-8B/blob/b96882/config.json"
+    view = Page(url=blob, title="config.json", text="head_dim 128 (rendered)")
+    out = with_model_config(view, by_url, asked=blob)
+    assert asked == list(pages)
+    assert '{"head_dim": 128}' in out.text and out.text.endswith("32,768 natively")
+    assert out.url == blob
+
+    # Other pages, deeper paths and a failed or non-JSON config.json leave the page alone.
+    for url in [
+        "https://example.com/Qwen/Qwen3-8B",
+        "https://huggingface.co/Qwen/Qwen3-8B/tree/main",
+    ]:
+        page = Page(url=url, title=None, text="x")
+        assert with_model_config(page, fetch) is page
+
+    def fails(url):
+        raise ToolError("HTTP 404")
+
+    assert with_model_config(card, fails) is card
+    html = lambda url: Page(url=url, title=None, text="<not json>")  # noqa: E731
+    assert with_model_config(card, html) is card

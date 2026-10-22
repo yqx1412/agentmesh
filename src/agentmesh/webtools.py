@@ -14,6 +14,7 @@ the connect (rebinding) is not covered.
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ MAX_BYTES = 3_000_000
 MAX_REDIRECTS = 5
 DEFAULT_CHARS = 8_000
 MAX_CHARS = 20_000
+MIN_RESULTS = 5
 TEXT_TYPES = ("text/plain", "text/markdown", "text/csv", "application/json", "text/x-")
 
 Resolver = Callable[[str, int], list[str]]
@@ -161,15 +163,28 @@ def search(query: str, max_results: int = 5) -> list[dict[str, str]]:
 
     if not query.strip():
         raise ToolError("query is empty")
-    max_results = max(1, min(max_results, 10))
+    # At least 5 returned: Research usually asks for 3, and over its saved "Qwen3-8B
+    # official model card or config.json" searches the Hugging Face card was in 9 of 39
+    # three-hit lists but in 19 of 29 with five or more. Ten are always asked for, so a
+    # model page ranked 6-10 still reaches the top (see below).
+    max_results = max(MIN_RESULTS, min(max_results, 10))
     try:
-        hits = DDGS().text(query, max_results=max_results)
+        hits = DDGS().text(query, max_results=10)
     except Exception as exc:  # ddgs raises its own exception types per backend
         raise ToolError(f"search failed: {type(exc).__name__}: {exc}") from exc
-    return [
+    results = [
         {"title": h.get("title", ""), "url": h.get("href", ""), "snippet": h.get("body", "")}
         for h in hits or []
+        if h.get("href")
     ]
+    # A model's own Hugging Face page first: Research fetches the first hit most of the
+    # time (174 of 229 saved Research runs), and when that was a PDF, a spec database or a
+    # guessed GitHub path it often never reached the model card further down the list.
+    return sorted(results, key=lambda r: not _primary_model_page(r["url"]))[:max_results]
+
+
+def _primary_model_page(url: str) -> bool:
+    return bool(_HF_MODEL.match(url) or _HF_CONFIG.match(url))
 
 
 server = MCPServer(
@@ -179,9 +194,15 @@ server = MCPServer(
 
 @server.tool()
 def web_search(query: str, max_results: int = 5) -> dict:
-    """Search the web. Returns up to max_results (at most 10) hits with title, url and a
-    short snippet. Snippets are not sources: fetch a page before relying on it."""
-    return {"query": query, "results": search(query, max_results)}
+    """Search the web. Returns between 5 and 10 hits (max_results, raised to 5 if lower)
+    with title, url and a short snippet. Snippets are not sources: fetch a page before
+    relying on it."""
+    results = search(query, max_results)
+    if not results:
+        # Live, an empty hit ({"title": "", "url": ""}) came back as a success and Research
+        # answered the question from another search's pages instead of searching again.
+        raise ToolError(f"no results for {query!r}; search again with fewer or other words")
+    return {"query": query, "results": results}
 
 
 @server.tool()
@@ -189,7 +210,60 @@ def fetch_url(url: str, offset: int = 0, max_chars: int = DEFAULT_CHARS) -> dict
     """Fetch a public web page and return its main text, max_chars at a time (default
     8000, at most 20000). If next_offset is not null, call again with that offset to read
     further. Only http(s) URLs on public addresses can be fetched."""
-    return page_window(fetch_page(url), offset, max_chars)
+    return page_window(with_model_config(fetch_page(url), asked=url), offset, max_chars)
+
+
+# A Hugging Face model page: https://huggingface.co/<org>/<model>, nothing after it.
+_HF_MODEL = re.compile(r"^https://huggingface\.co/([\w.-]+)/([\w.-]+)/?$")
+# The same model's config.json, at any revision (blob, raw or resolve).
+_HF_CONFIG = re.compile(
+    r"^https://huggingface\.co/([\w.-]+)/([\w.-]+)/(?:blob|raw|resolve)/([^/]+)/config\.json$"
+)
+CONFIG_NOTE = (
+    "(max_position_embeddings is the longest position the code allows. If it differs from "
+    "the context length the model card states, the card's is the model's native one.)"
+)
+
+
+def with_model_config(
+    page: Page, fetch: Callable[[str], Page] | None = None, *, asked: str | None = None
+) -> Page:
+    """A Hugging Face model card together with the repository's config.json, config first.
+
+    Cards often leave out architecture values: Qwen3-8B's gives layers and heads but no
+    head dimension, which is in config.json. Live, Research then reported 5,120 or an
+    assumed 128, and when it looked for config.json it tried github.com paths that don't
+    exist. The other way round, a Research step that fetched only config.json took its
+    max_position_embeddings (40,960) as the native context length the card gives (32,768),
+    so a fetched config.json gets the card after it. Fetching the other half can fail;
+    the page is then returned as it was."""
+    get = fetch or fetch_page
+    url = asked or page.url
+    if m := _HF_MODEL.match(url):
+        card = page
+        try:
+            config = get(f"https://huggingface.co/{m[1]}/{m[2]}/resolve/main/config.json")
+        except ToolError:
+            return page
+    elif m := _HF_CONFIG.match(url):
+        try:
+            # A blob URL is the rendered file view; the raw file is what the card pairs with.
+            config = page
+            if not page.text.lstrip().startswith("{"):
+                config = get(f"https://huggingface.co/{m[1]}/{m[2]}/resolve/{m[3]}/config.json")
+            card = get(f"https://huggingface.co/{m[1]}/{m[2]}")
+        except ToolError:
+            return page
+    else:
+        return page
+    if not config.text.lstrip().startswith("{") or card.text.lstrip().startswith("{"):
+        return page
+    shown = f"https://huggingface.co/{m[1]}/{m[2]}"
+    text = (
+        f"[This model's config.json, from {shown}/blob/main/config.json]\n{CONFIG_NOTE}\n"
+        f"{config.text.strip()}\n\n[The model card, from {shown}]\n{card.text.strip()}"
+    )
+    return Page(url=page.url, title=page.title, text=text)
 
 
 def main() -> None:

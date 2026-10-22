@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import re
 import threading
 import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -21,6 +23,7 @@ from agentos.tools import Policy, Tool, ToolError, ToolRegistry
 
 from agentmesh.access import GRANT, Grant, read_write_result
 from agentmesh.executor import TASK_ID, Cancelled, Progress, Runner, RunOutcome
+from agentmesh.numbers import TRIVIAL, numbers
 from agentmesh.spec import SANDBOX_TOOLS, AgentSpec
 
 
@@ -78,6 +81,8 @@ def missing_calls(messages: list[Message], required: dict[str, int]) -> dict[str
 
 
 _QUOTE = re.compile(r"[\"\u201c]([^\"\u201c\u201d\n]{20,})[\"\u201d]")
+# "4k", "128K": a number of thousands, as pages write context lengths.
+_THOUSANDS = re.compile(r"(?<![\w.,])(\d+)\s?[kK]\b")
 
 
 def _norm(text: str) -> str:
@@ -93,6 +98,43 @@ def invented_quotes(answer: str, messages: list[Message]) -> list[str]:
         if m.role == "tool" and not m.content.startswith("ERROR:")
     )
     return [q for q in _QUOTE.findall(answer) if _norm(q) not in seen]
+
+
+def _page_text(content: str) -> str:
+    """A fetch result's page text: fetch_url returns JSON whose "text" holds the page, and
+    its escaped newlines would otherwise glue a number to the "n" of "\\n"."""
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return content
+    if isinstance(data, dict):
+        return " ".join(str(data.get(k, "")) for k in ("title", "text"))
+    return content
+
+
+def unfetched_numbers(answer: str, messages: list[Message], fetch_tool: str) -> list[str]:
+    """Numbers in ``answer`` that no successful ``fetch_tool`` result contains and the
+    user's message doesn't give. Search snippets don't count: they are not sources.
+
+    Live, Research reported Qwen3-8B's head dimension as 5,120, a number its one fetched
+    page (the model card, which doesn't give a head dimension) never mentions."""
+    pages = [
+        _page_text(m.content.removeprefix("ERROR:"))
+        for m in messages
+        if m.role == "tool" and _matches(m.tool_name, fetch_tool)
+    ]
+    if not pages:
+        return []  # nothing fetched yet: the required-calls check asks for fetches
+    seen: set = set()
+    for p in pages:  # a failed fetch's text is its error ("HTTP 403"), which may be quoted
+        seen |= numbers(p).keys()
+        # "4k context" states 4,096 (or 4,000) tokens.
+        for m in _THOUSANDS.finditer(p):
+            seen |= {Decimal(m.group(1)) * 1000, Decimal(m.group(1)) * 1024}
+    for m in messages:
+        if m.role == "user":
+            seen |= numbers(m.content).keys()
+    return [t for v, t in numbers(answer).items() if v not in seen and v not in TRIVIAL]
 
 
 class AnswerGuardLLM:
@@ -112,12 +154,14 @@ class AnswerGuardLLM:
         required: dict[str, int] | None = None,
         *,
         check_quotes: bool = False,
+        check_numbers: str | None = None,
         max_nudges: int = 3,
     ) -> None:
         self.inner = inner
         self.model = inner.model
         self.required = required or {}
         self.check_quotes = check_quotes
+        self.check_numbers = check_numbers
         self.max_nudges = max_nudges
         self.nudges = 0
 
@@ -140,6 +184,17 @@ class AnswerGuardLLM:
                     f"{listed}. Quote only text copied exactly from a fetched page. If no "
                     "passage supports or contradicts a claim, its verdict is NOT FOUND. "
                     "Fetch again or read further if you need to, then rewrite the answer."
+                )
+        if self.check_numbers:
+            bad = unfetched_numbers(answer, messages, self.check_numbers)
+            if bad:
+                return (
+                    f"These numbers in your answer are in no page you fetched: "
+                    f"{', '.join(bad)}. Report a value only when a fetched page states it. "
+                    "Fetch a page that does (a model's architecture values such as its head "
+                    "dimension are in its config.json, which comes first when you fetch its "
+                    "Hugging Face page, https://huggingface.co/<org>/<model>), or say "
+                    "plainly that you could not find the value. Then rewrite the answer."
                 )
         return None
 
@@ -263,7 +318,10 @@ def agentos_runner(spec: AgentSpec, trace_dir: Path | None = None) -> Runner:
                 # Always guarded: an empty final answer is refused for every agent, and the
                 # spec's required tools and quote check are added where it asks for them.
                 model = AnswerGuardLLM(
-                    model, spec.require_before_answer, check_quotes=spec.check_quotes
+                    model,
+                    spec.require_before_answer,
+                    check_quotes=spec.check_quotes,
+                    check_numbers=spec.check_numbers,
                 )
                 agent = make_agent(
                     spec.kind,

@@ -40,6 +40,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,8 @@ from a2a.types import AgentCard, StreamResponse
 from agentmesh.access import WRITE_RECORD_HEADER
 from agentmesh.client import PushReceiver, TaskRun, ask, ask_push, cancel, discover
 from agentmesh.journal import JOURNAL_NAME, JsonlJournal
+from agentmesh.numbers import TRIVIAL as _TRIVIAL
+from agentmesh.numbers import numbers as _numbers
 
 MAX_STEPS = 6
 PLAN_ATTEMPTS = 3
@@ -1071,6 +1074,7 @@ async def combine(
     results: dict[str, StepResult],
     chat: Chat,
     writes_off: list[str] | None = None,
+    left_out: list[str] | None = None,
 ) -> ChatReply:
     context_start = STEP_CONTEXT.split("{task}")[0]
     parts = []
@@ -1085,6 +1089,8 @@ async def combine(
             f"Asked: {asked}\n\nResult:\n{body}"
         )
     note = f"\n\n{WRITES_OFF.format(skills=', '.join(writes_off))}" if writes_off else ""
+    if left_out:
+        note += "\n\n" + LEFT_OUT.format(values=", ".join(left_out))
     messages = [
         {"role": "system", "content": COMBINE_PROMPT},
         {
@@ -1109,6 +1115,65 @@ def write_records(plan: list[Step], results: dict[str, StepResult]) -> str:
         if items:
             blocks.append(f"{s.id} ({r.agent or s.skill}):\n" + "\n".join(items))
     return f"{WRITE_RECORD_HEADER}\n" + "\n".join(blocks) if blocks else ""
+
+
+# Said to the combiner when its first reply left out values the steps looked up.
+LEFT_OUT = (
+    "Your previous reply left out these values that the steps looked up and the "
+    "computation used: {values}. Write the reply again, and state each of them with what "
+    "it is and its source."
+)
+# A task that asks for values to be found, so the reply must state them (COMBINE_PROMPT).
+_ASKS_LOOKUP = re.compile(r"\b(find|look(?:s|ing)? (?:it |them )?up|search)\b", re.I)
+
+
+def values_left_out(
+    task: str,
+    plan: list[Step],
+    results: dict[str, StepResult],
+    catalogue: Catalogue,
+    answer: str,
+) -> list[str]:
+    """Values the steps looked up and a computing step used, that the reply doesn't state.
+
+    Live, the summary sometimes replied with only "RATIO: 8.0" although the task asked to
+    find Ollama's default window and Qwen3-8B's context length (2 of 10 ratio runs failed
+    on it). A looked-up value is a number in the answer of a computing step (a skill its
+    card tags ``math``) that also appears in the answer of a step it depends on, directly
+    or not, and is not in the task itself. Only checked when the task asks to find, look
+    up or search for something."""
+    if not _ASKS_LOOKUP.search(task):
+        return []
+    by_id = {s.id: s for s in plan}
+
+    def computes(s: Step) -> bool:
+        return any(MATH_TAG in (getattr(k, "tags", None) or []) for k in catalogue.get(s.skill, []))
+
+    def upstream(sid: str, seen: set[str]) -> set[str]:
+        for d in by_id[sid].depends_on:
+            if d in by_id and d not in seen:
+                seen.add(d)
+                upstream(d, seen)
+        return seen
+
+    given = _numbers(task)
+    used: dict[Decimal, str] = {}
+    for s in plan:
+        r = results.get(s.id)
+        if r is None or not r.ok or not computes(s):
+            continue
+        computed = _numbers(r.answer)
+        for d in upstream(s.id, set()):
+            dr = results.get(d)
+            if dr is None or not dr.ok or computes(by_id[d]):
+                continue
+            for value, text in _numbers(dr.answer).items():
+                # 0, 1 and 2 are counts and factors ("1 window", "x2 for K and V", "2
+                # bytes") far more often than looked-up values.
+                if value in computed and value not in given and value not in _TRIVIAL:
+                    used.setdefault(value, text)
+    stated = _numbers(answer)
+    return [text for value, text in used.items() if value not in stated]
 
 
 @dataclass
@@ -1328,12 +1393,31 @@ async def _orchestrate(
     except Exception as exc:
         return finish("failed", f"combining failed: {type(exc).__name__}: {exc}", stop="error")
     out.answer = reply.content.strip()
+    out.tokens["prompt"] += reply.prompt_tokens
+    out.tokens["completion"] += reply.completion_tokens
+    if missing := values_left_out(task, out.plan, out.results, catalogue, out.answer):
+        # Asked once more with the values named; the second reply is kept only if it
+        # leaves out fewer of them.
+        rec.state(
+            "working",
+            message=f"the reply left out looked-up values ({', '.join(missing)}), asking again",
+        )
+        try:
+            again = await combine(task, out.plan, out.results, chat, writes_off, missing)
+        except Exception as exc:
+            rec.state("working", message=f"asking again failed, keeping the first reply: {exc}")
+        else:
+            out.tokens["prompt"] += again.prompt_tokens
+            out.tokens["completion"] += again.completion_tokens
+            still = values_left_out(task, out.plan, out.results, catalogue, again.content)
+            if len(still) < len(missing):
+                out.answer, reply = again.content.strip(), again
+            if still:
+                rec.state("working", message=f"the reply still leaves out: {', '.join(still)}")
     if records := write_records(out.plan, out.results):
         # Built by the Knowledge agent's code from add_fact's results, so the user sees
         # what was really stored even when the summary calls a duplicate "stored".
         out.answer = f"{out.answer}\n\n{records}"
-    out.tokens["prompt"] += reply.prompt_tokens
-    out.tokens["completion"] += reply.completion_tokens
     rec.event(
         "llm_response",
         step=model_step + 1,

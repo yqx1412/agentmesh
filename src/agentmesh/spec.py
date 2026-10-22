@@ -104,6 +104,9 @@ class AgentSpec(BaseModel):
     # Every "double-quoted" string of 20+ characters in the final answer must appear in some
     # tool result; an answer with an invented quote is sent back (a few times at most).
     check_quotes: bool = False
+    # A tool name (Research: "fetch_url"): every number in the final answer must appear in
+    # one of that tool's successful results or in the task, else the answer is sent back.
+    check_numbers: str | None = None
     # qwen3's reasoning mode: slower, but needed for multi-step arithmetic.
     think: bool = False
     workspace: Path

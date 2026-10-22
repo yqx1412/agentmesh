@@ -525,3 +525,137 @@ def test_a_skill_may_repeat_when_one_step_needs_the_others_result():
     # A re-plan's new step may reuse a skill an earlier (done) step used.
     replan = plan(step("s3", "web_research", "Find the context length."))
     assert parse_plan(replan, cat, done=frozenset({"s1"}), taken=frozenset({"s1", "s2"}))
+
+
+# --- the final reply states the values the steps looked up ------------------------------
+
+RATIO_TASK = (
+    "Find Ollama's default context window size and Qwen3-8B's native context length. "
+    "How many of Ollama's default windows fit in Qwen3-8B's native context? "
+    'End with one line "RATIO: <number>".'
+)
+LOOKED_UP = (
+    "Ollama's default context window is **4,096 tokens** (https://docs.ollama.com/faq). "
+    "Qwen3-8B's native context length is 32,768 tokens."
+)
+COMPUTED = "32768 / 4096 = 8.0 windows fit."
+
+
+def _ran(answers_by_id: dict[str, str]) -> dict:
+    return {sid: SimpleNamespace(answer=a, ok=True) for sid, a in answers_by_id.items()}
+
+
+def _ratio_plan():
+    from agentmesh.orchestrator import Step
+
+    return [
+        Step("s1", "web_research", "Find both values."),
+        Step("s2", "calculate", "How many fit? {{s1}}", ["s1"]),
+    ]
+
+
+MATH_CAT = {
+    "web_research": [SimpleNamespace(tags=[])],
+    "calculate": [SimpleNamespace(tags=["math"])],
+}
+
+
+@pytest.mark.parametrize(
+    ("answer", "missing"),
+    [
+        # Live, 2 of 10 ratio summaries were only this line.
+        ("RATIO: 8.0", ["4,096", "32,768"]),
+        ("Qwen3-8B's 32768 tokens hold 8 windows.\nRATIO: 8", ["4,096"]),
+        ("4096 and 32,768 tokens (docs.ollama.com/faq): 8 fit.\nRATIO: 8.0", []),
+    ],
+)
+def test_values_left_out(answer, missing):
+    from agentmesh.orchestrator import values_left_out
+
+    results = _ran({"s1": LOOKED_UP, "s2": COMPUTED})
+    assert values_left_out(RATIO_TASK, _ratio_plan(), results, MATH_CAT, answer) == missing
+
+
+def test_values_left_out_only_counts_looked_up_values_the_computation_used():
+    from agentmesh.orchestrator import values_left_out
+
+    plan_ = _ratio_plan()
+    # 24 GiB is only in the lookup, 0.125 only in the computation, 3 and 8 in "Qwen3-8B"
+    # and 2 is a factor: none of them is a looked-up value the computation used.
+    results = _ran(
+        {
+            "s1": LOOKED_UP + " Below 24 GiB of VRAM. Qwen3-8B uses 2 bytes per value.",
+            "s2": COMPUTED + " The inverse is 0.125; 2 bytes per value.",
+        }
+    )
+    assert values_left_out(RATIO_TASK, plan_, results, MATH_CAT, "4,096; 32768.") == []
+    # A value given in the task is not a looked-up one.
+    given = RATIO_TASK.replace("Find", "With a window of 4096 tokens, find")
+    assert values_left_out(given, plan_, results, MATH_CAT, "32,768") == []
+    # A task that doesn't ask to find anything is not checked.
+    asked = "How many 4096-token windows fit in 32768 tokens?"
+    assert values_left_out(asked, plan_, results, MATH_CAT, "8") == []
+    # Nor is a plan with no computing skill, or a failed step.
+    untagged = {"web_research": [SimpleNamespace(tags=[])], "calculate": [SimpleNamespace()]}
+    assert values_left_out(RATIO_TASK, plan_, results, untagged, "8") == []
+    results["s2"].ok = False
+    assert values_left_out(RATIO_TASK, plan_, results, MATH_CAT, "8") == []
+
+
+async def test_a_reply_that_leaves_out_looked_up_values_is_asked_for_again(tmp_path):
+    calc = SkillSpec(id="calculate", name="calculate", description="computes", tags=["math"])
+    fleet = Fleet(
+        tmp_path,
+        {
+            "Research": (9001, "web_research", answers(LOOKED_UP)),
+            "Analyst": (9002, calc, answers(COMPUTED)),
+        },
+    )
+    full = "Ollama's window is 4,096 tokens and Qwen3-8B's is 32,768 tokens; 8 fit.\nRATIO: 8.0"
+    chat = ScriptedChat(
+        plan(
+            step("s1", "web_research", "Find both values."),
+            step(
+                "s2",
+                "calculate",
+                "How many of Ollama's default windows fit in Qwen3-8B's native context? {{s1}}",
+                ["s1"],
+            ),
+        ),
+        "RATIO: 8.0",
+        full,
+    )
+    out = await orchestrate(RATIO_TASK, await cards_of(fleet), chat, fleet.http, policy=NO_WAIT)
+    assert out.state == "completed", out.message
+    assert out.answer == full
+    assert len(chat.calls) == 3  # plan, combine, combine again
+    again = chat.calls[2][0][-1]["content"]
+    assert "left out these values" in again and "4,096, 32,768" in again
+    assert out.tokens["completion"] == 30
+
+
+async def test_a_second_reply_that_is_no_better_is_not_kept(tmp_path):
+    calc = SkillSpec(id="calculate", name="calculate", description="computes", tags=["math"])
+    fleet = Fleet(
+        tmp_path,
+        {
+            "Research": (9001, "web_research", answers(LOOKED_UP)),
+            "Analyst": (9002, calc, answers(COMPUTED)),
+        },
+    )
+    chat = ScriptedChat(
+        plan(
+            step("s1", "web_research", "Find both values."),
+            step(
+                "s2",
+                "calculate",
+                "How many of Ollama's default windows fit in Qwen3-8B's native context? {{s1}}",
+                ["s1"],
+            ),
+        ),
+        "4,096 tokens.\nRATIO: 8.0",
+        "RATIO: 8",
+    )
+    out = await orchestrate(RATIO_TASK, await cards_of(fleet), chat, fleet.http, policy=NO_WAIT)
+    assert out.answer == "4,096 tokens.\nRATIO: 8.0"
+    assert len(chat.calls) == 3

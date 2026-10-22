@@ -389,6 +389,75 @@ only `RATIO: 8.0`, dropping the two values the task asked to look up. The KV fai
 were Research's lookups: a head dimension of 8, and `config.json`'s 40,960 used as the
 native context length.
 
+**The final reply states the looked-up values.** When the task asks to find, look up or
+search for something, the orchestrator checks the final reply for every value the steps
+looked up and a computing step used: a number in a `math` step's answer that also
+appears in the answer of a step it depends on, and isn't in the task itself (0, 1 and 2
+are ignored as counts and factors; URLs and names like "Qwen3-8B" don't count). If any
+are missing, the summary is asked once more with those values named, and the second
+reply is kept only if it leaves out fewer. Over 277 saved runs with a computing step, the
+check never fired on a task that doesn't ask for a lookup, and it caught both summaries
+above. Composite tasks again, fleet only, **10 runs each**:
+
+| Task | Passed | Median | Reply asked again |
+|---|---|---|---|
+| Qwen3-8B KV cache | 9/10 | 129 s | 0 |
+| Context-window ratio | 9/10 | 83 s | 1 (fixed) |
+| Lecture speed-up | 10/10 | 88 s | 10 (all fixed) |
+
+No reply left a value out after the second try. The lecture summary always gave only the
+speed-up at first, without the two timings the task asked to find (its check doesn't need
+them, so it passed before too); each fix cost one extra summary call. Both failures were
+Research's lookups again: a head dimension of 5,120 (the hidden size) and 32,768 as
+Ollama's default for a GPU under 24 GiB.
+
+**Research's numbers come from pages it fetched.** Those two failures had one cause: the
+value was in no page Research fetched. Qwen3-8B's model card gives no head dimension, so
+5,120 was made up, and Research had answered the Ollama question after a search that came
+back as one empty hit. Most passing KV runs had the same gap: their 128 was from memory.
+The fixes are in code:
+- **Number check** (`check_numbers = "fetch_url"` in `agents/research.toml`): a final
+  answer with a number that's in no fetched page and not in the task is sent back, like
+  the Verifier's quote check. URLs, list markers, names like "Qwen3-8B" and 0-2 don't count,
+  and "4k" on a page covers 4,096. Over 296 saved Research answers it would have fired on 34,
+  mostly the remembered 128.
+- **Model card and config.json together** (`webtools.with_model_config`): fetching a
+  Hugging Face model page also returns its `config.json`, first, with a note that
+  `max_position_embeddings` isn't the native context length when the card says otherwise.
+  Fetching a `config.json` (any revision) also returns the card. Research had looked for
+  `config.json` on GitHub paths that don't exist, and when it fetched only `config.json`
+  it took 40,960 as the native length.
+- **Search:** an empty hit is dropped, and no hits at all is an error, so Research searches
+  again. Ten hits are always fetched from DuckDuckGo, at least five are returned, and a
+  model's own Hugging Face pages are moved to the top: Research fetched the first hit in
+  174 of 229 saved runs, and its usual query's 3- or 5-hit lists often left the card out
+  while a 10-hit list included it.
+- **Prompt:** a model card is the model's Hugging Face page or its developer's site, not a
+  spec database or context-window list.
+
+Fleet only, **10 runs each**, adding the fixes one at a time:
+
+| After | KV cache | Ratio |
+|---|---|---|
+| Summary check (above) | 9/10 | 9/10 |
+| Number check, empty-search fix | 3/7 (stopped) | 6/6 |
+| Card and config.json together | 8/10 | 9/10 |
+| config.json also brings the card | 10/10 | 8/10 |
+| Model-card prompt rule | 7/10 | 10/10 |
+| At least 5 hits | 3/7 (stopped) | 7/7 |
+| 10 fetched, model pages first | **10/10** | **9/10** |
+
+With the number check alone, Research honestly said the card has no head dimension and
+the Analyst assumed one; each later row fixes how Research gets to the page that has it.
+In the last round every KV run read the head dimension from `config.json`. The one ratio
+failure took 40,960 from contextwindows.dev: no Hugging Face page was among that search's
+10 hits. The number check never fired in the last 65 live runs, since the values were now
+on the fetched pages; it stays as the guard for when they aren't. Rows differ by more than
+any one fix explains, so treat single rows as noisy: 19/20 in the last round against 18/20
+before these fixes is not a significant difference by itself. The 5 research tasks passed
+4/5; `r-mcp-definition` failed because the MCP intro page Research fetched no longer has
+the USB-C comparison in its extracted text.
+
 ## Development
 
 ```powershell

@@ -197,9 +197,14 @@ All secrets sit in one folder that every agent process can read. What keeps an
 agent's model away from it is the AgentOS tool confinement: file tools stay in the
 workspace, and the `run_python` sandbox refuses file access outside it. That
 contains a confused model, not a hostile one. The next step would be separate OS
-users or containers per agent. The source check matches URLs, not statements: a claim
-the Verifier never saw can still be stored under a URL that supported some other
-claim, as long as the per-claim count allows it.
+users or containers per agent. The source check also matches statements now: a write
+must cite a URL the Verifier marked SUPPORTED *and* say what it checked with that URL
+(the claim it was asked, with the quote it found). Every number in the statement must be
+there, and at least 60% of its content words, so rewording passes but another claim
+under the same URL doesn't. Over 50 saved Verifier verdicts, no unsupported claim that
+shared a URL with a supported one would have passed. It's a word-level match, not
+entailment: a statement built from a verified claim's own words can still twist its
+meaning.
 
 ## M6: one agent vs. the whole fleet
 

@@ -406,6 +406,79 @@ def test_only_supported_lines_count_as_sources():
     assert dict(supported_sources(text)) == {"https://a.example/x": 2}
 
 
+CLAIMS_IN = (
+    "Check these claims:\n"
+    "1. llama.cpp supports speculative decoding with a draft model. [https://a.example/doc]\n"
+    "2. llama.cpp was written in Rust. [https://a.example/doc]\n"
+    "3. Qwen3-8B has 36 layers. [https://b.example/card]\n"
+)
+CLAIMS_OUT = (
+    '1. SUPPORTED - "--model-draft sets the draft model" [https://a.example/doc]\n'
+    '2. CONTRADICTED - "written in C/C++" [https://a.example/doc]\n'
+    '3. SUPPORTED - "Number of Layers: 36" [https://b.example/card]\n'
+)
+
+
+def test_supported_claims_pair_each_verdict_with_the_claim_it_checked():
+    from agentmesh.auth import supported_claims
+
+    got = supported_claims(CLAIMS_IN, CLAIMS_OUT)
+    assert [url for url, _ in got] == ["https://a.example/doc", "https://b.example/card"]
+    assert "speculative decoding" in got[0][1] and "--model-draft" in got[0][1]
+    assert "Rust" not in got[0][1] and "36 layers" in got[1][1]
+    # A verdict whose input numbers no claims still gives the quote.
+    assert "Number of Layers" in supported_claims("free text", CLAIMS_OUT)[1][1]
+
+
+def test_statement_matches_rewording_but_not_another_claim():
+    from agentmesh.access import statement_matches
+
+    ev = "llama.cpp supports speculative decoding with a draft model. --model-draft sets it"
+    assert statement_matches("llama.cpp supports speculative decoding", ev)
+    assert statement_matches("Speculative decoding is supported by llama.cpp (draft model)", ev)
+    assert not statement_matches("llama.cpp was written in Rust", ev)
+    layers = "Qwen3-8B has 36 layers. Number of Layers: 36"
+    assert statement_matches("Qwen3-8B has 36 layers", layers)
+    assert not statement_matches("Qwen3-8B has 40 layers", layers)  # a number must match
+    assert not statement_matches("the", layers)  # nothing to check
+
+
+def test_a_write_must_state_a_claim_the_verifier_supported(tmp_path):
+    """The URL used to be enough: any statement could ride on a source that supported
+    some other claim. Now it must be one the Verifier checked with that source."""
+    init_auth(tmp_path / "s")
+    auth = AuthConfig.load(tmp_path / "s")
+    token = sign_attestation(
+        auth.signing_key("verifier"),
+        "verifier",
+        agent="Verifier Agent",
+        task="v1",
+        caller="orchestrator",
+        input=CLAIMS_IN,
+        answer=CLAIMS_OUT,
+    )
+    spec = load_spec(AGENTS / "knowledge.toml")
+    grant = Access(spec, auth).admit("orchestrator", "knowledge_write", [token])
+    stored = []
+    (add,) = apply_grant([_tool("add_fact", lambda a: stored.append(a) or {"id": 1})], grant)
+    with pytest.raises(ToolError, match="did not check this statement"):
+        add.fn({"statement": "llama.cpp was written in Rust", "source": "https://a.example/doc"})
+    with pytest.raises(ToolError, match="did not check this statement"):
+        add.fn({"statement": "Qwen3-8B has 40 layers", "source": "https://b.example/card"})
+    add.fn(
+        {"statement": "llama.cpp supports speculative decoding", "source": "https://a.example/doc"}
+    )
+    add.fn({"statement": "Qwen3-8B has 36 layers.", "source": "https://b.example/card"})
+    assert len(stored) == 2
+    with pytest.raises(ToolError, match="already stored"):
+        add.fn(
+            {
+                "statement": "llama.cpp supports speculative decoding",
+                "source": "https://a.example/doc",
+            }
+        )
+
+
 def _tool(name: str, fn) -> Tool:
     return Tool(name=name, description=name, args_model=None, fn=fn, input_schema={}, source="mcp")
 

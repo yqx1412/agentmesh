@@ -19,6 +19,7 @@ a ``Grant`` that the executor hands the runner (through ``GRANT``) for the third
 from __future__ import annotations
 
 import json
+import re
 import threading
 from collections import Counter
 from contextvars import ContextVar
@@ -30,9 +31,11 @@ from agentmesh.auth import (
     AuthConfig,
     norm_url,
     sign_attestation,
+    supported_claims,
     supported_sources,
     verify_attestation,
 )
+from agentmesh.numbers import TRIVIAL, numbers
 from agentmesh.spec import AgentSpec, SkillSpec
 
 # Most signed results one request may carry.
@@ -67,6 +70,42 @@ def source_of(args: Any) -> str:
         return details["source"]
     src = args.get("source")
     return src if isinstance(src, str) else ""
+
+
+_WORDS = re.compile(r"[a-z0-9]+(?:[.'-][a-z0-9]+)*")
+_STOP = frozenset(
+    {
+        *("the", "and", "for", "with", "that", "this", "from", "are", "was", "were", "has"),
+        *("have", "had", "its", "it's", "into", "onto", "than", "then", "can", "could"),
+        *("will", "would", "should", "may", "might", "also", "which", "who", "what", "when"),
+        *("where", "how", "does", "did", "not", "but", "all", "any", "each", "per", "via"),
+        *("about", "over", "under", "more", "most", "such", "only", "own", "same", "other"),
+        *("their", "they", "them", "his", "her", "our", "your", "you", "one"),
+    }
+)
+# Share of a statement's content words that must be in what the Verifier checked.
+MATCH_SHARE = 0.6
+
+
+def statement_matches(statement: str, evidence: str) -> bool:
+    """Whether ``statement`` says what ``evidence`` (a claim the Verifier supported, with
+    its quote) says: every number in it is in the evidence, and at least ``MATCH_SHARE`` of
+    its content words are too (a shared 5-letter prefix counts, so "supports" matches
+    "support"). Rewording passes; a different claim under the same URL doesn't."""
+    want = {v for v in numbers(statement) if v not in TRIVIAL}
+    if not want <= set(numbers(evidence)):
+        return False
+    have = set(_WORDS.findall(evidence.lower()))
+    stems = {w[:5] for w in have if len(w) >= 5}
+    content = [
+        w
+        for w in _WORDS.findall(statement.lower())
+        if len(w) >= 3 and w not in _STOP and not w.replace(".", "").replace(",", "").isdigit()
+    ]
+    if not content:
+        return False
+    hits = sum(w in have or (len(w) >= 5 and w[:5] in stems) for w in content)
+    return hits >= MATCH_SHARE * len(content)
 
 
 @dataclass
@@ -112,6 +151,10 @@ class Grant:
     attested_tools: list[str] = field(default_factory=list)
     # Remaining uses per supported source URL (normalised).
     budget: Counter[str] = field(default_factory=Counter)
+    # Per supported URL, what the Verifier checked with it (claim + quote), one entry per
+    # claim not yet stored. A write must state one of them, not just cite the URL.
+    claims: dict[str, list[str]] = field(default_factory=dict)
+    _spent: dict[str, list[str]] = field(default_factory=dict, repr=False)
     signed: list[str] = field(default_factory=list)  # the signed tasks' ids
     # One entry per attested write that went through: what the tool said it did.
     writes: list[WriteRecord] = field(default_factory=list)
@@ -160,12 +203,27 @@ class Grant:
                     else "the Verifier did not mark any claim with this source SUPPORTED"
                 )
                 return url, f"refused: {src}: {why}. Sources still allowed: {listed}"
+            if url in self.claims:
+                statement = read_write_result(args, None).statement
+                left = self.claims[url]
+                match = next((e for e in left if statement_matches(statement, e)), None)
+                if match is None:
+                    checked = "; ".join(f'"{" ".join(e.split())[:160]}"' for e in left)
+                    return url, (
+                        f"refused: the Verifier did not check this statement with {src}. "
+                        f"What it supported with that source: {checked}. Store one of those "
+                        "claims as it was verified."
+                    )
+                left.remove(match)
+                self._spent.setdefault(url, []).append(match)
             self.budget[url] -= 1
             return url, None
 
     def refund(self, url: str) -> None:
         with self._lock:
             self.budget[url] += 1
+            if self._spent.get(url):
+                self.claims[url].append(self._spent[url].pop())
 
 
 # The current task's grant (None when the agent runs without auth). Set by the executor;
@@ -220,6 +278,10 @@ class Access:
                 continue
             grant.signed.append(str(payload.get("task", "")))
             grant.budget.update(supported_sources(str(payload.get("answer", ""))))
+            for url, evidence in supported_claims(
+                str(payload.get("input", "")), str(payload.get("answer", ""))
+            ):
+                grant.claims.setdefault(url, []).append(evidence)
         if not grant.signed:
             raise Refused(f"{skill.id}: no valid {issuer} signature ({'; '.join(problems)})")
         if skill.attested_tools and not grant.budget:

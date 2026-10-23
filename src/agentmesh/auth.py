@@ -348,3 +348,26 @@ def supported_sources(answer: str) -> Counter[str]:
             for url in dict.fromkeys(norm_url(u) for u in _URL.findall(line)):
                 found[url] += 1
     return found
+
+
+_NUMBERED = re.compile(r"^\s*(?:[-*]\s*)?(\d+)[.)]\s*(.*)$")
+
+
+def supported_claims(input: str, answer: str) -> list[tuple[str, str]]:
+    """``(url, evidence)`` for every claim the Verifier marked SUPPORTED. The evidence is
+    the claim as the Verifier was asked it (the same-numbered line of its input, when the
+    input numbers its claims) plus the quote it found, so a write can be checked against
+    what was actually verified, not only against the URL."""
+    asked: dict[str, str] = {}
+    for line in input.splitlines():
+        if m := _NUMBERED.match(line):
+            asked.setdefault(m[1], _URL.sub(" ", m[2]))
+    out = []
+    for line in answer.splitlines():
+        if not _SUPPORTED.match(line):
+            continue
+        n = _NUMBERED.match(line)[1]  # type: ignore[index]  # _SUPPORTED implies it
+        evidence = f"{asked.get(n, '')} {_URL.sub(' ', line)}"
+        for url in dict.fromkeys(norm_url(u) for u in _URL.findall(line)):
+            out.append((url, evidence))
+    return out

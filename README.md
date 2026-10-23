@@ -474,13 +474,6 @@ only in its header, which trafilatura drops. A fetched model card now starts wit
 (license, base model, pipeline tag and other short fields; the gated-access form and
 `model-index` are left out). It costs one more request per model card.
 
-When a search names a model (`Qwen3-8B`, `qwen3:8b`, `org/model`) and none of its hits is
-a Hugging Face model page, `web_search` asks the hub's own search
-(`huggingface.co/api/models`) for a model with exactly that name and puts its page first.
-The last failing ratio run had no such hit and took 40,960 from a context-window list.
-Live, the fleet passed the ratio, KV and five research tasks 21/21 (3 each); the lookup
-fired in all 3 ratio runs, whose searches again returned no Hugging Face page.
-
 **Second full M6 rerun** (2026-10-23, same tasks and settings, with every fix above;
 details in the [write-up](benchmarks/results/m6-single-vs-multi.md#second-rerun-2026-10-23),
 raw data in `benchmarks/results/m6-rerun-2/`):
@@ -495,6 +488,13 @@ raw data in `benchmarks/results/m6-rerun-2/`):
 The single agent's spec is unchanged, though its web tools got the fetch and search fixes.
 With 3 repeats, 48/48 is partly luck; the 10-run composite evals above (about 90-95%) are
 the better estimate for chained tasks.
+
+After that rerun: when a search names a model (`Qwen3-8B`, `qwen3:8b`, `org/model`) and
+none of its hits is a Hugging Face model page, `web_search` asks the hub's own search
+(`huggingface.co/api/models`) for a model with exactly that name and puts its page first.
+The last failing ratio run had no such hit and took 40,960 from a context-window list.
+Live, the fleet passed the ratio, KV and five research tasks 21/21 (3 each); the lookup
+fired in all 3 ratio runs, whose searches again returned no Hugging Face page.
 
 ## Development
 

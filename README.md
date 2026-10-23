@@ -491,6 +491,13 @@ The single agent's spec is unchanged, though its web tools got the fetch and sea
 With 3 repeats, 48/48 is partly luck; the 10-run composite evals above (about 90-95%) are
 the better estimate for chained tasks.
 
+After that rerun: when a search names a model (`Qwen3-8B`, `qwen3:8b`, `org/model`) and
+none of its hits is a Hugging Face model page, `web_search` asks the hub's own search
+(`huggingface.co/api/models`) for a model with exactly that name and puts its page first.
+The last failing ratio run had no such hit and took 40,960 from a context-window list.
+Live, the fleet passed the ratio, KV and five research tasks 21/21 (3 each); the lookup
+fired in all 3 ratio runs, whose searches again returned no Hugging Face page.
+
 ## Development
 
 ```powershell

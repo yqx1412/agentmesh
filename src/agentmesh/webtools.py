@@ -199,10 +199,63 @@ def search(query: str, max_results: int = 5) -> list[dict[str, str]]:
         for h in hits or []
         if h.get("href")
     ]
+    if results and not any(_primary_model_page(r["url"]) for r in results):
+        # The last failing ratio run: none of the 10 hits for Qwen3-8B was a Hugging Face
+        # page, so Research took 40,960 from a context-window list. Ask the model hub.
+        for name in model_names(query):
+            if page := find_model_page(name):
+                results.insert(0, page)
+                break
     # A model's own Hugging Face page first: Research fetches the first hit most of the
     # time (174 of 229 saved Research runs), and when that was a PDF, a spec database or a
     # guessed GitHub path it often never reached the model card further down the list.
     return sorted(results, key=lambda r: not _primary_model_page(r["url"]))[:max_results]
+
+
+# A model name as people write it: letters and digits joined by "-", "." or ":" with a
+# digit somewhere, e.g. Qwen3-8B, Llama-3.1-8B-Instruct, gemma-2-9b, qwen3:8b. Requiring a
+# separator keeps words like "fp16" or "H100" out.
+_MODEL_NAME = re.compile(r"(?<![\w/.:-])((?:[\w.-]+/)?[A-Za-z][\w]*(?:[-:.][\w]+)+)(?![\w/-])")
+
+
+def model_names(query: str) -> list[str]:
+    """Candidate model names in a search query, normalised to the hub's spelling
+    (``qwen3:8b`` -> ``qwen3-8b``). An ``org/model`` name keeps its org."""
+    names = []
+    for m in _MODEL_NAME.finditer(query):
+        name = m[1].replace(":", "-").strip(".-")
+        if re.search(r"\d", name) and re.search(r"[A-Za-z]", name) and name not in names:
+            names.append(name)
+    return names
+
+
+def find_model_page(name: str, transport: httpx.BaseTransport | None = None) -> dict | None:
+    """The Hugging Face page of the model called ``name``, from the hub's own search: the
+    most downloaded model whose name (or org/name) is exactly ``name``, ignoring case.
+    None when there is none or the hub can't be reached."""
+    try:
+        with httpx.Client(
+            timeout=10, transport=transport, headers={"User-Agent": USER_AGENT}
+        ) as client:
+            resp = client.get(
+                "https://huggingface.co/api/models",
+                params={"search": name.split("/")[-1], "sort": "downloads", "limit": 20},
+            )
+            resp.raise_for_status()
+            models = resp.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    want = name.lower()
+    for model in models if isinstance(models, list) else []:
+        mid = str(model.get("id") or model.get("modelId") or "")
+        if mid.lower() == want or mid.split("/")[-1].lower() == want:
+            return {
+                "title": f"{mid} - Hugging Face",
+                "url": f"https://huggingface.co/{mid}",
+                "snippet": "The model's own page, found through the Hugging Face hub's search "
+                "(the web search returned no Hugging Face page).",
+            }
+    return None
 
 
 def _primary_model_page(url: str) -> bool:

@@ -474,6 +474,21 @@ only in its header, which trafilatura drops. A fetched model card now starts wit
 (license, base model, pipeline tag and other short fields; the gated-access form and
 `model-index` are left out). It costs one more request per model card.
 
+**Second full M6 rerun** (2026-10-23, same tasks and settings, with every fix above;
+details in the [write-up](benchmarks/results/m6-single-vs-multi.md#second-rerun-2026-10-23),
+raw data in `benchmarks/results/m6-rerun-2/`):
+
+| | single | multi |
+|---|---|---|
+| Runs passed | 36/48 (first rerun: 34) | 48/48 (first rerun: 47) |
+| Passed, every cited page fetched | 26/48 (23) | 48/48 (46) |
+| Composite | 5/9 (6) | 9/9 (9) |
+| Median time / mean tokens | 34 s / 6.1k | 45 s / 15.9k |
+
+The single agent's spec is unchanged, though its web tools got the fetch and search fixes.
+With 3 repeats, 48/48 is partly luck; the 10-run composite evals above (about 90-95%) are
+the better estimate for chained tasks.
+
 ## Development
 
 ```powershell

@@ -18,6 +18,12 @@ overstates how the fleet would do on new chained tasks. See
 [Rerun with the fixes](#rerun-with-the-fixes-2026-10-19). The sections before it
 describe the original 2026-10-18 run.
 
+**Update, 2026-10-23:** after PRs #14-#18, a second full rerun passed 48/48 on the fleet,
+every cited page fetched, and 36/48 on the single agent, whose prompt is unchanged but
+whose web tools got the fetch and search fixes too. 3 repeats is a small sample: 10-run
+evals of the composite tasks put the fleet at about 90-95% on them. See
+[Second rerun](#second-rerun-2026-10-23).
+
 Raw data: [`m6/results.jsonl`](m6/results.jsonl) (one line per run, with the answer,
 check results, cost and fetched pages), [`m6/report.md`](m6/report.md) (all tables),
 [`m6/meta.json`](m6/meta.json). Tasks: [`../m6/tasks.yaml`](../m6/tasks.yaml).
@@ -255,6 +261,82 @@ Per task, the fleet passed more often on 6 tasks, less often on none and equally
   whether it still would with `--allow-writes`.
 - The earlier caveats (16 self-written tasks, repeats that aren't independent, guards
   as a confound, tokens across two model sizes) still apply.
+
+## Second rerun (2026-10-23)
+
+The same 16 tasks, 3 repeats per system, timeouts and hardware, on `main` at `ef8febc`
+plus the two fetch fixes of PR #18 (`meta.json` records this as `ef8febc-dirty`; the
+fixes were committed after the run, unchanged). Raw data:
+[`m6-rerun-2/results.jsonl`](m6-rerun-2/results.jsonl),
+[`m6-rerun-2/report.md`](m6-rerun-2/report.md),
+[`m6-rerun-2/meta.json`](m6-rerun-2/meta.json).
+
+What changed since the first rerun:
+
+- the planner adds a verification step only when the task asks for a check or before a
+  knowledge-base write; it gives each skill one step; Research searches and fetches
+  separately for each thing it is asked about (#14)
+- the task's format lines (`RATIO:`, `FALSE:`) are removed from each step's answer;
+  duplicate knowledge-base writes are reported as already stored (#15)
+- `parse_plan` rejects a computing step that doesn't ask the task's question in its words
+  (#16)
+- the final reply is asked again if it leaves out a value the steps looked up; Research's
+  answers are sent back if they contain a number from no fetched page (#17)
+- web tools: a Hugging Face model card comes with its `config.json`; search always takes
+  10 hits, drops empty ones and puts the model's own pages first (#17); paragraphs written
+  as `<span data-as="p">` are kept, and a model card starts with its license and other
+  front-matter fields (#18)
+
+The single agent's spec (`agents/solo.toml`) did not change, but it uses the same web
+tools, so the last bullet applies to it too.
+
+| | single, first run | multi, first run | single, rerun | multi, rerun | single, now | multi, now |
+|---|---|---|---|---|---|---|
+| Runs passed | 35/48 | 39/48 | 34/48 | 47/48 | 36/48 | 48/48 |
+| Passed, every cited page fetched | 23/48 | 37/48 | 23/48 | 46/48 | 26/48 | 48/48 |
+| Checks passed | 58/75 | 64/75 | 60/78 | 77/78 | 63/78 | 78/78 |
+| Median / mean time per run | 27 / 34 s | 45 / 59 s | 31 / 39 s | 44 / 51 s | 34 / 42 s | 45 / 50 s |
+| Mean tokens per run | 4,707 | 16,032 | 5,501 | 20,438 | 6,066 | 15,895 |
+| Runs that cited an unfetched page | 14 of 14 | 2 of 19 | 13 of 13 | 1 of 18 | 12 of 12 | 0 of 19 |
+| Composite passed | 6/9 | 2/9 | 6/9 | 9/9 | 5/9 | 9/9 |
+
+**Fleet:** every task passed 3/3. Against the first rerun, the only per-task change is
+the license lookup (2/3 -> 3/3): the plan is a single Research step again (49 s median,
+was 67 s), and the card's text now contains its license. Mean tokens fell from 20.4k to
+15.9k, mostly on verification (40.0k -> 9.5k; the claim check's median went from 49 s to
+21 s) and research (28.7k -> 22.9k), so the fleet now costs about 2.6x the single agent's
+tokens (3.7x in the first rerun). The composite tasks got slower (median 82 s -> 96 s):
+the KV task from 84 s to 103 s and the lecture speed-up from 71 s to 96 s, whose plan
+lost a step but whose summary, in the 10-run evals described next, was asked again every
+time.
+
+**Two full reruns in between** aren't published here. On `62867a9` (after #15) the fleet
+passed 44/48 with composites 5/9: PR #15's plan `format` field made the planner reword
+"how many A fit in B" as "the ratio of A to B" (ratio task 0/3), which #16 fixed. On
+`ef8febc` (after #17) it passed 45/48 with composites 9/9; all three failures were the MCP
+question, whose "USB-C" line the fetch tool dropped, which #18 fixed. Between them, the
+composite tasks were run **10 times each** on the fleet: after #16, lecture 10/10, KV
+8/10, ratio 8/10; with #17's summary check, 10/10, 9/10 and 9/10; with all of #17, KV
+10/10 and ratio 9/10 (lecture not rerun).
+
+**Single agent:** 36 vs 34 passed is within what an unchanged agent varies by
+(`v-three-claims` 0 -> 3 and `r-qwen-license` 2 -> 3, but `c-ollama-ratio` 2 -> 0 and
+`r-llama-draft` 2 -> 1). Its failures are the same kinds: all 12 citing answers cited a
+page it never fetched, it searched the lecture notes for the MCP question in 2 of 3 runs
+(and found no definition in the third),
+no timestamp was in the right window on `k-table-doubling` (0/3), and on the ratio task it
+replied only `RATIO: 8.0`, without the two values the task asked to look up (0/3).
+
+**How to read it:**
+
+- **48/48 was partly luck.** With 3 repeats, a task that passes 90% of the time still
+  scores 3/3 about 73% of the time. The 10-run composite evals above are the better
+  estimate for chained tasks.
+- **Still not a fresh measurement.** Every fix since the first run was written after
+  reading failures on these 16 tasks and checked on them.
+- **Research reads live pages,** and two of the regressions between reruns came from the
+  web side (a docs page's markup, a model card's header), not from the agents.
+- **No writes were possible**, as in the first rerun, and the earlier caveats still apply.
 
 ## Reproducing
 

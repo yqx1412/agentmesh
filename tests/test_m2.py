@@ -274,6 +274,61 @@ def test_web_search_drops_empty_hits_ranks_model_pages_first(monkeypatch):
     ]
 
 
+def test_model_names_in_search_queries():
+    from agentmesh.webtools import model_names
+
+    assert model_names("Qwen3-8B native context length") == ["Qwen3-8B"]
+    assert model_names("qwen3:8b context window") == ["qwen3-8b"]
+    assert model_names("meta-llama/Llama-3.1-8B config.json") == ["meta-llama/Llama-3.1-8B"]
+    for q in ["fp16 KV cache on an H100", "Ollama default context window", "llama.cpp draft"]:
+        assert model_names(q) == [], q
+
+
+def test_find_model_page_takes_the_exact_name_from_the_hub():
+    from agentmesh.webtools import find_model_page
+
+    asked = []
+
+    def hub(req):
+        asked.append(req.url.params["search"])
+        return httpx.Response(200, json=[{"id": "someone/Qwen3-8B-GGUF"}, {"id": "Qwen/Qwen3-8B"}])
+
+    page = find_model_page("qwen3-8b", transport=httpx.MockTransport(hub))
+    assert page["url"] == "https://huggingface.co/Qwen/Qwen3-8B" and asked == ["qwen3-8b"]
+    assert find_model_page("Qwen3-4B", transport=httpx.MockTransport(hub)) is None
+    down = httpx.MockTransport(lambda r: httpx.Response(503))
+    assert find_model_page("Qwen3-8B", transport=down) is None
+
+
+def test_search_adds_the_model_page_when_no_hit_is_one(monkeypatch):
+    import sys
+    import types
+
+    from agentmesh import webtools
+
+    hits = [{"title": "List", "href": "https://contextwindows.dev/qwen3-8b", "body": "40960"}]
+    fake = types.SimpleNamespace(DDGS=lambda: types.SimpleNamespace(text=lambda q, **kw: hits))
+    monkeypatch.setitem(sys.modules, "ddgs", fake)
+    looked = []
+
+    def page(name):
+        looked.append(name)
+        return {
+            "title": "Qwen/Qwen3-8B",
+            "url": "https://huggingface.co/Qwen/Qwen3-8B",
+            "snippet": "",
+        }
+
+    monkeypatch.setattr(webtools, "find_model_page", page)
+    urls = [r["url"] for r in webtools.search("Qwen3-8B native context length")]
+    assert urls == ["https://huggingface.co/Qwen/Qwen3-8B", "https://contextwindows.dev/qwen3-8b"]
+    # No lookup when a model page is already a hit, or the query names no model.
+    hits.append({"title": "Card", "href": "https://huggingface.co/Qwen/Qwen3-8B", "body": ""})
+    webtools.search("Qwen3-8B native context length")
+    webtools.search("Ollama default context window")
+    assert looked == ["Qwen3-8B"]
+
+
 # --- webtools ----------------------------------------------------------------------------
 
 

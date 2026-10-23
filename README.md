@@ -137,7 +137,9 @@ uv run agentmesh orchestrate "..." --push            # follow steps by webhook
   card lists the same skill, in discovery order. `--no-fallback` turns this off.
 - **Timeouts cancel:** `--step-timeout` now bounds each attempt, and a timed-out
   attempt's remote task is cancelled over A2A, so the agent stops working on it.
-  Cancelling the whole orchestration cancels every remote task still running.
+  Cancelling the whole orchestration cancels every remote task still running, including
+  one whose agent hasn't yet reported its task id: the step waits up to 5 s for the id
+  before giving up.
 - **Push notifications:** agents advertise A2A push support. With `--push` the
   orchestrator gives each task a webhook on `127.0.0.1` instead of holding a
   stream open. Agents accept webhooks only on loopback addresses, so an agent

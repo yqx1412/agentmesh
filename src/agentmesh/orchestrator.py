@@ -876,20 +876,59 @@ async def _attempt(
         )
     else:
         call = ask(skill.card, r.input, http, on_event=seen, metadata=meta)
+    # The call runs as its own task so that a cancel of this coroutine doesn't cut it off
+    # before the agent has told us the task id: without the id there is nothing to cancel.
+    job = asyncio.ensure_future(call)
     try:
-        return await asyncio.wait_for(call, policy.step_timeout)
-    except TimeoutError:
-        a.state, a.message = "timeout", f"no result after {policy.step_timeout:g} s"
-    except asyncio.CancelledError:
-        if a.task_id:  # the orchestration was cancelled: stop the agent too
-            await asyncio.shield(_cancel_remote(step, skill, a, http, rec))
+        finished, _ = await asyncio.wait({job}, timeout=policy.step_timeout)
+    except asyncio.CancelledError:  # the orchestration was cancelled: stop the agent too
+        await asyncio.shield(_stop(job, step, skill, a, http, rec))
         raise
-    except Exception as exc:
-        a.state, a.message = "unreachable", f"{type(exc).__name__}: {exc}"[:500]
-        return None
+    if finished:
+        try:
+            return job.result()
+        except Exception as exc:
+            a.state, a.message = "unreachable", f"{type(exc).__name__}: {exc}"[:500]
+            return None
+    await _drop(job)
+    a.state, a.message = "timeout", f"no result after {policy.step_timeout:g} s"
     if a.task_id:
         await _cancel_remote(step, skill, a, http, rec)
     return None
+
+
+# How long a cancelled step waits for the agent to report its task id, so the cancel can
+# reach the remote task. The id is normally the agent's first reply, within milliseconds.
+ID_WAIT = 5.0
+
+
+async def _stop(
+    job: asyncio.Future,
+    step: Step,
+    skill: Skill,
+    a: Attempt,
+    http: httpx.AsyncClient,
+    rec: Recorder,
+) -> None:
+    deadline = time.monotonic() + ID_WAIT
+    while not a.task_id and not job.done() and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+    if a.task_id and not job.done():
+        await _cancel_remote(step, skill, a, http, rec)
+    elif not a.task_id and not job.done():
+        rec.state(
+            "working",
+            message=f"{step.id}: {a.agent} gave no task id in {ID_WAIT:g} s; nothing to cancel",
+        )
+    await _drop(job)
+
+
+async def _drop(job: asyncio.Future) -> None:
+    """Cancel the call and wait for it to unwind, ignoring how it ends."""
+    job.cancel()
+    await asyncio.wait({job})  # never raises the call's own error
+    if not job.cancelled():
+        job.exception()  # mark it retrieved: the call's outcome no longer matters
 
 
 async def _cancel_remote(

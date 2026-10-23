@@ -77,6 +77,27 @@ class Page:
     text: str
 
 
+def _mark_paragraphs(raw: str) -> str:
+    """Turn elements that render as paragraphs (``data-as="p"``) into real ``<p>`` tags.
+
+    Some docs sites (Mintlify, e.g. modelcontextprotocol.io) emit paragraphs as
+    ``<span data-as="p">``. Trafilatura drops the loose spans that come before the first
+    heading, which is where a page's lead paragraph sits -- the MCP intro lost its
+    "USB-C port" sentence that way.
+    """
+    if 'data-as="p"' not in raw and "data-as='p'" not in raw:
+        return raw
+    from lxml import html as lxml_html
+
+    try:
+        tree = lxml_html.fromstring(raw)
+    except (ValueError, lxml_html.etree.ParserError):
+        return raw
+    for el in tree.xpath("//*[@data-as='p']"):
+        el.tag = "p"
+    return lxml_html.tostring(tree, encoding="unicode")
+
+
 def _to_text(body: bytes, content_type: str, url: str) -> tuple[str | None, str]:
     charset = "utf-8"
     if "charset=" in content_type:
@@ -88,6 +109,7 @@ def _to_text(body: bytes, content_type: str, url: str) -> tuple[str | None, str]
         raise ToolError(f"unsupported content type {content_type.split(';')[0]!r}")
     import trafilatura
 
+    raw = _mark_paragraphs(raw)
     text = trafilatura.extract(raw, url=url, include_tables=True, include_comments=False)
     meta = trafilatura.extract_metadata(raw, default_url=url)
     title = meta.title if meta is not None else None
@@ -259,11 +281,55 @@ def with_model_config(
     if not config.text.lstrip().startswith("{") or card.text.lstrip().startswith("{"):
         return page
     shown = f"https://huggingface.co/{m[1]}/{m[2]}"
+    meta = card_metadata(m[1], m[2], get)
     text = (
         f"[This model's config.json, from {shown}/blob/main/config.json]\n{CONFIG_NOTE}\n"
-        f"{config.text.strip()}\n\n[The model card, from {shown}]\n{card.text.strip()}"
+        f"{config.text.strip()}\n\n[The model card, from {shown}]\n"
+        + (f"{meta}\n" if meta else "")
+        + card.text.strip()
     )
     return Page(url=page.url, title=page.title, text=text)
+
+
+def card_metadata(org: str, model: str, fetch: Callable[[str], Page]) -> str | None:
+    """The card's header fields (license, base model, ...) as one line, or None.
+
+    The rendered card shows them only in its page header ("License: apache-2.0"), which
+    trafilatura drops, so the fetched text had neither "license" nor "apache" and Research
+    said the license wasn't on the page. They come from the YAML front matter of the
+    repository's README.md. Only short values are kept, and none of the gated-access form
+    (extra_gated_*, which on a gated model includes the whole licence agreement);
+    model-index holds benchmark tables and is left out too."""
+    import yaml
+
+    try:
+        raw = fetch(f"https://huggingface.co/{org}/{model}/resolve/main/README.md").text
+    except ToolError:
+        return None
+    m = re.match(r"\s*---\r?\n(.*?)\r?\n---\s*(?:\n|$)", raw, re.S)
+    if not m:
+        return None
+    try:
+        data = yaml.safe_load(m[1])
+    except yaml.YAMLError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    fields = []
+    for key, value in data.items():
+        if str(key).startswith("extra_gated"):
+            continue  # the gated-access form's text, not facts about the model
+        if (
+            isinstance(value, list)
+            and len(value) <= 10
+            and all(isinstance(v, str | int | float) for v in value)
+        ):
+            value = ", ".join(str(v) for v in value)
+        if isinstance(value, str | int | float) and not isinstance(value, bool):
+            value = " ".join(str(value).split())
+            if value and len(value) <= 200:
+                fields.append(f"{key}: {value}")
+    return f"Card metadata: {'; '.join(fields)}" if fields else None
 
 
 def main() -> None:

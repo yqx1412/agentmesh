@@ -327,6 +327,36 @@ def test_fetch_extracts_text_and_windows():
     assert page_window(page, w["total_chars"] - 10, 500)["next_offset"] is None
 
 
+def test_fetch_keeps_lead_paragraph_rendered_as_span():
+    # Mintlify-style docs page: the lead paragraphs are <span data-as="p"> before the first
+    # heading. Trafilatura alone drops them (the MCP intro lost its "USB-C port" line).
+    body = (
+        "<html><head><title>What is MCP?</title></head><body><main>"
+        '<div id="content">'
+        '<span data-as="p">MCP is an open-source standard for connecting AI applications.</span>'
+        '<span data-as="p">Think of MCP like a USB-C port for AI applications. Just as USB-C '
+        "provides a standardized way to connect electronic devices, MCP provides one for AI.</span>"
+        "<h2>What can MCP enable?</h2>"
+        "<p>Agents can access your calendar and your notes, acting as a personal assistant, "
+        "and chatbots can connect to many databases across an organization.</p>"
+        "<h2>Why does MCP matter?</h2>"
+        "<p>Depending on where you sit in the ecosystem, MCP can have a range of benefits "
+        "for developers, for AI applications and for the people who use them.</p>"
+        "</div></main></body></html>"
+    )
+
+    def handler(request):
+        return httpx.Response(200, text=body, headers={"content-type": "text/html; charset=utf-8"})
+
+    page = fetch_page(
+        "http://public.test/intro",
+        resolve=resolver("93.184.215.14"),
+        transport=httpx.MockTransport(handler),
+    )
+    assert "USB-C port" in page.text
+    assert "Depending on where you sit" in page.text
+
+
 # --- fleet -------------------------------------------------------------------------------
 
 
@@ -363,7 +393,10 @@ def test_hugging_face_model_page_and_config_json_come_together():
 
     card = Page(url="https://huggingface.co/Qwen/Qwen3-8B", title="Qwen3-8B", text="Layers: 36")
     out = with_model_config(card, fetch)
-    assert asked == ["https://huggingface.co/Qwen/Qwen3-8B/resolve/main/config.json"]
+    assert asked == [
+        "https://huggingface.co/Qwen/Qwen3-8B/resolve/main/config.json",
+        "https://huggingface.co/Qwen/Qwen3-8B/resolve/main/README.md",
+    ]
     assert out.text.startswith(
         "[This model's config.json, from https://huggingface.co/Qwen/Qwen3-8B/blob/main/config.json]"
         "\n(max_position_embeddings is the longest position"
@@ -380,6 +413,9 @@ def test_hugging_face_model_page_and_config_json_come_together():
     pages = {
         "https://huggingface.co/Qwen/Qwen3-8B/resolve/b96882/config.json": '{"head_dim": 128}',
         "https://huggingface.co/Qwen/Qwen3-8B": "Context Length: 32,768 natively",
+        "https://huggingface.co/Qwen/Qwen3-8B/resolve/main/README.md": (
+            "---\nlicense: apache-2.0\n---\n# Qwen3-8B"
+        ),
     }
     asked.clear()
 
@@ -391,7 +427,10 @@ def test_hugging_face_model_page_and_config_json_come_together():
     view = Page(url=blob, title="config.json", text="head_dim 128 (rendered)")
     out = with_model_config(view, by_url, asked=blob)
     assert asked == list(pages)
-    assert '{"head_dim": 128}' in out.text and out.text.endswith("32,768 natively")
+    assert '{"head_dim": 128}' in out.text and out.text.endswith(
+        "[The model card, from https://huggingface.co/Qwen/Qwen3-8B]\n"
+        "Card metadata: license: apache-2.0\nContext Length: 32,768 natively"
+    )
     assert out.url == blob
 
     # Other pages, deeper paths and a failed or non-JSON config.json leave the page alone.
@@ -408,3 +447,37 @@ def test_hugging_face_model_page_and_config_json_come_together():
     assert with_model_config(card, fails) is card
     html = lambda url: Page(url=url, title=None, text="<not json>")  # noqa: E731
     assert with_model_config(card, html) is card
+
+
+def test_card_metadata_keeps_the_short_header_fields():
+    from agentmesh.webtools import Page, card_metadata
+
+    readme = (
+        "---\nlanguage:\n- en\n- de\nlicense: llama3.1\nbase_model: meta-llama/Llama-3.1-8B\n"
+        f'extra_gated_prompt: "{"LICENSE AGREEMENT " * 50}"\n'
+        "extra_gated_button_content: Submit\n"
+        "model-index:\n- name: x\n  results: []\ninference: false\n---\n# Card\n"
+    )
+    seen = []
+
+    def fetch(url):
+        seen.append(url)
+        return Page(url=url, title=None, text=readme)
+
+    line = card_metadata("meta-llama", "Llama-3.1-8B-Instruct", fetch)
+    assert seen == [
+        "https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct/resolve/main/README.md"
+    ]
+    # The gated-access form (with its licence agreement), the benchmark table and the bool
+    # are left out.
+    assert line == (
+        "Card metadata: language: en, de; license: llama3.1; base_model: meta-llama/Llama-3.1-8B"
+    )
+
+    def fails(url):
+        raise ToolError("HTTP 404")
+
+    no_header = lambda url: Page(url=url, title=None, text="# Card only")  # noqa: E731
+    bad_yaml = lambda url: Page(url=url, title=None, text="---\n: [\n---\n")  # noqa: E731
+    for get in (fails, no_header, bad_yaml):
+        assert card_metadata("a", "b", get) is None

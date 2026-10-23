@@ -458,6 +458,37 @@ before these fixes is not a significant difference by itself. The 5 research tas
 4/5; `r-mcp-definition` failed because the MCP intro page Research fetched no longer has
 the USB-C comparison in its extracted text.
 
+That last failure was the fetch tool, not the page. The MCP docs (a Mintlify site) write
+their paragraphs as `<span data-as="p">`, and trafilatura drops the loose spans before the
+first heading, which is where the lead paragraph and its "USB-C port" line sit. The full
+M6 rerun on `ef8febc` failed that task 3/3 for the fleet (45/48 overall, composites 9/9).
+`fetch_page` now turns `data-as="p"` elements into real `<p>` tags before extracting. On
+the Ollama FAQ, another Mintlify site, this also stops trafilatura repeating half-sentences
+around inline code ("Use theollama ps command ... command to see ..."). Live, fleet only:
+`r-mcp-definition` 3/3 with the intro page cited, context-window ratio 3/3, and the 5
+research tasks 5/5 once each.
+
+The Hugging Face card hid its license the same way: the page shows "License: apache-2.0"
+only in its header, which trafilatura drops. A fetched model card now starts with a
+`Card metadata:` line built from the front matter of the repository's `README.md`
+(license, base model, pipeline tag and other short fields; the gated-access form and
+`model-index` are left out). It costs one more request per model card.
+
+**Second full M6 rerun** (2026-10-23, same tasks and settings, with every fix above;
+details in the [write-up](benchmarks/results/m6-single-vs-multi.md#second-rerun-2026-10-23),
+raw data in `benchmarks/results/m6-rerun-2/`):
+
+| | single | multi |
+|---|---|---|
+| Runs passed | 36/48 (first rerun: 34) | 48/48 (first rerun: 47) |
+| Passed, every cited page fetched | 26/48 (23) | 48/48 (46) |
+| Composite | 5/9 (6) | 9/9 (9) |
+| Median time / mean tokens | 34 s / 6.1k | 45 s / 15.9k |
+
+The single agent's spec is unchanged, though its web tools got the fetch and search fixes.
+With 3 repeats, 48/48 is partly luck; the 10-run composite evals above (about 90-95%) are
+the better estimate for chained tasks.
+
 ## Development
 
 ```powershell

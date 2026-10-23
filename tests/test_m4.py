@@ -419,6 +419,77 @@ async def test_cancelling_the_orchestration_cancels_the_remote_task(tmp_path):
     assert _states(root / "orchestrator" / JOURNAL_NAME)[-1] == "canceled"
 
 
+async def test_a_cancel_before_the_task_id_still_reaches_the_remote_task(tmp_path, monkeypatch):
+    # The agent reports its task id only after the orchestration is cancelled. Before the
+    # fix the cancel cut the call off and nothing was sent, so the remote run went on.
+    from a2a.types import StreamResponse, Task
+
+    import agentmesh.orchestrator as orch
+
+    reported, cancelled = asyncio.Event(), []
+
+    async def late_id(card, text, http, *, on_event=None, metadata=None, **_):
+        await asyncio.sleep(0.3)
+        on_event(StreamResponse(task=Task(id="remote-1")))
+        reported.set()
+        await asyncio.sleep(30)
+
+    async def fake_cancel(card, task_id, http):
+        cancelled.append(task_id)
+        return "canceled"
+
+    monkeypatch.setattr(orch, "ask", late_id)
+    monkeypatch.setattr(orch, "cancel", fake_cancel)
+    fleet = Fleet(tmp_path, {"Slow": (9345, "work", done("unused"))})
+    job = asyncio.create_task(
+        orchestrate(
+            "t",
+            await fleet.cards(),
+            ScriptedChat(plan(("s1", "work", []))),
+            fleet.http,
+            policy=RunPolicy(step_timeout=30),
+        )
+    )
+    await asyncio.sleep(0.1)  # the call is in flight, no task id yet
+    job.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await job
+    assert reported.is_set() and cancelled == ["remote-1"]
+
+
+async def test_a_cancel_without_any_task_id_gives_up_after_the_wait(tmp_path, monkeypatch):
+    import agentmesh.orchestrator as orch
+
+    cancelled = []
+
+    async def never(card, text, http, **_):
+        await asyncio.sleep(30)
+
+    async def fake_cancel(card, task_id, http):
+        cancelled.append(task_id)
+        return "canceled"
+
+    monkeypatch.setattr(orch, "ask", never)
+    monkeypatch.setattr(orch, "cancel", fake_cancel)
+    monkeypatch.setattr(orch, "ID_WAIT", 0.2)
+    fleet = Fleet(tmp_path, {"Slow": (9346, "work", done("unused"))})
+    job = asyncio.create_task(
+        orchestrate(
+            "t",
+            await fleet.cards(),
+            ScriptedChat(plan(("s1", "work", []))),
+            fleet.http,
+            policy=RunPolicy(step_timeout=30),
+        )
+    )
+    await asyncio.sleep(0.1)
+    started = time.monotonic()
+    job.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await job
+    assert cancelled == [] and time.monotonic() - started < 2
+
+
 def _states(path: Path) -> list[str]:
     if not path.exists():
         return []

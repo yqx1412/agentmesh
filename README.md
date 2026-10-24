@@ -517,6 +517,19 @@ that (every cited page fetched) it fired on none. Live, fleet only: license 3/3,
 and the 5 research tasks 5/5, no answer citing an unfetched page. The guard never had to
 fire: in 4 of these runs the NVIDIA PDF's fetch failed, and none of them cited it.
 
+The number check now reads the pages each claim cites. A number on a line that cites URLs
+(one of Research's claims) must be on a fetched page that line cites; the summary's
+numbers may come from any fetched page the answer cites, or from any fetched page when it
+cites none. Before, any fetched page counted: the 4,096 claimed for Ollama citing
+ssdnodes.com passed because 4096 is also Qwen3-8B's `hidden_size`, in the `config.json`
+fetched with the card another claim cited. Replayed on saved traces it flags exactly the
+3 bad answers of that rerun (two of them cited the failed PDF fetch) and none of 32 good
+ones (the rerun before it and the citation check's live runs); over 566 saved Research
+answers it
+fires on 10 more than before, each a value cited to a page that doesn't state it (often a
+correct head dimension of 128 cited to the card instead of `config.json`). Live, fleet
+only: ratio 3/3 and KV cache 3/3, every cited page fetched.
+
 ## Development
 
 ```powershell

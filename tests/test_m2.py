@@ -532,6 +532,85 @@ def test_fetch_keeps_lead_paragraph_rendered_as_span():
     assert "Depending on where you sit" in page.text
 
 
+def _pdf(lines: list[str], title: str = "Qwen3-8B Model Card") -> bytes:
+    """A minimal one-page PDF with a real text layer (Helvetica, one line per entry)."""
+    ops = "BT /F1 12 Tf 72 720 Td 14 TL " + " ".join(f"({s}) Tj T*" for s in lines) + " ET"
+    stream = ops.encode("latin-1")
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+        b"<< /Title (" + title.encode("latin-1") + b") >>",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    out += b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R /Info 6 0 R >>\n" % (len(objs) + 1)
+    out += b"startxref\n%d\n%%%%EOF\n" % xref
+    return bytes(out)
+
+
+@pytest.mark.parametrize("ctype", ["application/pdf", "application/octet-stream"])
+def test_fetch_reads_pdf_text(ctype):
+    # NVIDIA's Qwen3-8B model card is a PDF; the fetch used to refuse it as
+    # "unsupported content type 'application/pdf'" and Research cited it anyway.
+    body = _pdf(["Qwen3-8B Instruct", "Context length: 32,768 tokens", "License: Apache 2.0"])
+
+    def handler(request):
+        return httpx.Response(200, content=body, headers={"content-type": ctype})
+
+    page = fetch_page(
+        "http://public.test/card.pdf",
+        resolve=resolver("93.184.215.14"),
+        transport=httpx.MockTransport(handler),
+    )
+    assert "Context length: 32,768 tokens" in page.text
+    assert "License: Apache 2.0" in page.text
+    assert page.title == "Qwen3-8B Model Card"
+
+
+def test_fetch_pdf_errors_are_reported():
+    def handler(request):
+        if request.url.path == "/broken.pdf":
+            return httpx.Response(
+                200, content=b"%PDF-1.4 garbage", headers={"content-type": "application/pdf"}
+            )
+        return httpx.Response(200, content=_pdf([]), headers={"content-type": "application/pdf"})
+
+    for path, message in (
+        ("/broken.pdf", "cannot read PDF"),
+        ("/empty.pdf", "no extractable text"),
+    ):
+        with pytest.raises(ToolError, match=message):
+            fetch_page(
+                f"http://public.test{path}",
+                resolve=resolver("93.184.215.14"),
+                transport=httpx.MockTransport(handler),
+            )
+
+
+def test_fetch_still_refuses_other_binary_types():
+    def handler(request):
+        return httpx.Response(
+            200, content=b"PK\x03\x04", headers={"content-type": "application/zip"}
+        )
+
+    with pytest.raises(ToolError, match="unsupported content type"):
+        fetch_page(
+            "http://public.test/a.zip",
+            resolve=resolver("93.184.215.14"),
+            transport=httpx.MockTransport(handler),
+        )
+
+
 # --- fleet -------------------------------------------------------------------------------
 
 

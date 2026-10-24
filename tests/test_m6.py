@@ -197,6 +197,31 @@ def test_trace_stats_counts_agents_and_skips_delegations(tmp_path):
     assert s["fetched"] == ["https://a.example"]
 
 
+def test_trace_stats_counts_the_url_after_a_redirect(tmp_path):
+    # NVIDIA's model-card PDF redirects to another host; the answer cited the final URL,
+    # and the eval used to report it as an unfetched citation.
+    asked = "https://developer.nvidia.com/downloads/assets/card.pdf"
+    final = "https://developer.download.nvidia.com/assets/Card.pdf"
+    a = _write(
+        tmp_path / "research" / "t-1.jsonl",
+        [
+            {
+                "event": "tool_result",
+                "ok": True,
+                "call": {"name": "web__fetch_url", "arguments": {"url": asked}},
+                "output": json.dumps({"url": final, "title": None, "text": "..."}),
+            },
+            {
+                "event": "tool_result",
+                "ok": True,
+                "call": {"name": "web__fetch_url", "arguments": {"url": "https://b.example/"}},
+                "output": "not json",
+            },
+        ],
+    )
+    assert trace_stats([a])["fetched"] == [asked, final, "https://b.example"]
+
+
 def test_guard_reports_tokens_of_refused_replies():
     class Inner:
         model = "m"

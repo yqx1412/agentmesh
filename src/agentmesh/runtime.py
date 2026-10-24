@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import ipaddress
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, TextIO
+from urllib.parse import urlsplit
 
 from agentos.agent import DEFAULT_SYSTEM_PROMPT, Agent, Tracer
 from agentos.bench.runner import make_agent
@@ -25,6 +27,7 @@ from agentmesh.access import GRANT, Grant, read_write_result
 from agentmesh.executor import TASK_ID, Cancelled, Progress, Runner, RunOutcome
 from agentmesh.numbers import TRIVIAL, numbers
 from agentmesh.spec import SANDBOX_TOOLS, AgentSpec
+from agentmesh.urls import normalize_url, urls_in
 
 
 class ProgressTracer(Tracer):
@@ -137,6 +140,75 @@ def unfetched_numbers(answer: str, messages: list[Message], fetch_tool: str) -> 
     return [t for v, t in numbers(answer).items() if v not in seen and v not in TRIVIAL]
 
 
+def fetched_urls(messages: list[Message], fetch_tool: str) -> set[str]:
+    """Normalized URLs of every successful ``fetch_tool`` call: the URL asked for and the
+    page's own URL after redirects (fetch_url's result has a ``url`` field)."""
+    asked = {
+        tc.id: tc.arguments.get("url")
+        for m in messages
+        if m.role == "assistant"
+        for tc in m.tool_calls or []
+        if _matches(tc.name, fetch_tool) and isinstance(tc.arguments, dict)
+    }
+    seen: set[str] = set()
+    for m in messages:
+        if m.role != "tool" or not _matches(m.tool_name, fetch_tool):
+            continue
+        if m.content.startswith("ERROR:"):
+            continue
+        url = asked.get(m.tool_call_id or "")
+        if isinstance(url, str) and url:
+            seen |= _cited_form(url)
+        try:
+            data = json.loads(m.content)
+        except json.JSONDecodeError:
+            continue
+        final = data.get("url") if isinstance(data, dict) else None
+        if isinstance(final, str) and final:
+            seen |= _cited_form(final)
+        # A fetched Hugging Face card carries its config.json and the other way round, each
+        # under a "[..., from <url>]" heading (webtools.with_model_config).
+        text = data.get("text") if isinstance(data, dict) else None
+        if isinstance(text, str):
+            seen |= {normalize_url(u) for u in _PART_FROM.findall(text)}
+    return seen
+
+
+_PART_FROM = re.compile(r"^\[[^\]\n]*, from (https?://[^\s\]]+)\]$", re.M)
+
+
+def _cited_form(url: str) -> set[str]:
+    """A fetched URL as an answer's citation of it is read: the citation pattern stops at
+    a comma (llm-explorer.com's ".../Qwen3-8B,6sQs..." is cited as ".../Qwen3-8B")."""
+    return {normalize_url(url), *urls_in(url)}
+
+
+def _is_local(url: str) -> bool:
+    """A loopback or private address ("http://localhost:11434") is a setting the answer
+    reports, not a source it cites; fetch_url can't reach one anyway."""
+    host = urlsplit(url).hostname or ""
+    if host == "localhost" or host.endswith((".localhost", ".local")):
+        return True
+    try:
+        return not ipaddress.ip_address(host).is_global
+    except ValueError:
+        return False
+
+
+def unfetched_citations(
+    answer: str, messages: list[Message], fetch_tool: str, also_fetched: set[str] = frozenset()
+) -> list[str]:
+    """URLs ``answer`` cites that no successful ``fetch_tool`` call returned (``also_fetched``
+    adds fetches no longer in ``messages``). The task's own URLs don't count as citations.
+
+    In the 2026-10-23b M6 rerun, two Research answers cited NVIDIA's model card PDF after
+    its fetch had failed ("unsupported content type"), and one cited ssdnodes.com, which
+    Research never fetched. Only a prompt rule asked for fetched citations."""
+    given = {u for m in messages if m.role == "user" for u in urls_in(m.content)}
+    fetched = fetched_urls(messages, fetch_tool) | also_fetched
+    return [u for u in urls_in(answer) if u not in fetched and u not in given and not _is_local(u)]
+
+
 class AnswerGuardLLM:
     """Sends an unacceptable final answer back to the model with a reminder.
 
@@ -155,6 +227,7 @@ class AnswerGuardLLM:
         *,
         check_quotes: bool = False,
         check_numbers: str | None = None,
+        check_citations: str | None = None,
         max_nudges: int = 3,
     ) -> None:
         self.inner = inner
@@ -162,6 +235,8 @@ class AnswerGuardLLM:
         self.required = required or {}
         self.check_quotes = check_quotes
         self.check_numbers = check_numbers
+        self.check_citations = check_citations
+        self.fetched: set[str] = set()
         self.max_nudges = max_nudges
         self.nudges = 0
 
@@ -196,9 +271,23 @@ class AnswerGuardLLM:
                     "Hugging Face page, https://huggingface.co/<org>/<model>), or say "
                     "plainly that you could not find the value. Then rewrite the answer."
                 )
+        if self.check_citations:
+            bad = unfetched_citations(answer, messages, self.check_citations, self.fetched)
+            if bad:
+                return (
+                    "You cite pages you did not fetch successfully: "
+                    f"{', '.join(bad)}. Cite only pages whose fetch returned their text; a "
+                    "search result or a fetch that failed is not a source. Fetch the page "
+                    "now if you need it, or remove that citation and anything only it "
+                    "supports. Then rewrite the answer."
+                )
         return None
 
     def chat(self, messages: list[Message], tools: list[dict[str, Any]]) -> ChatResponse:
+        if self.check_citations:
+            # The agent compacts long histories, which can drop an early fetch's result, so
+            # fetches seen on any earlier call count too (one guard serves one task).
+            self.fetched |= fetched_urls(messages, self.check_citations)
         resp = self.inner.chat(messages, tools)
         extra: list[Message] = []
         p_tok = c_tok = 0  # tokens of the replies sent back
@@ -322,6 +411,7 @@ def agentos_runner(spec: AgentSpec, trace_dir: Path | None = None) -> Runner:
                     spec.require_before_answer,
                     check_quotes=spec.check_quotes,
                     check_numbers=spec.check_numbers,
+                    check_citations=spec.check_citations,
                 )
                 agent = make_agent(
                     spec.kind,

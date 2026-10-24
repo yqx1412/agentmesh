@@ -512,6 +512,21 @@ an unfetched page. Re-scored from their traces, M6 and both published reruns are
 unchanged. Live, fleet only: license 3/3, all three reading the PDF, and KV cache 3/3,
 every cited page fetched.
 
+Research's citations are now checked in code (`check_citations = "fetch_url"` in
+`research.toml`): an answer citing a URL no successful `fetch_url` call returned goes back
+to Research, like the number check. A redirect's final URL and the card/`config.json`
+pages a Hugging Face fetch returns together count as fetched; the task's own URLs and
+local addresses (`http://localhost:11434` as a value) are not citations. The guard keeps
+the fetches it has seen, so a history compaction can't make a cited page look unfetched.
+Before, only a prompt rule asked for this, and the next full rerun had 3 fleet answers
+citing pages never fetched (a failed PDF fetch twice, ssdnodes.com once). Over 555 saved
+Research answers it would have fired on 16, all real: those 3, and earlier citations of
+pages whose fetch failed or never happened. On the 21 Research answers of the rerun before
+that (every cited page fetched) it fired on none. Live, fleet only: license 3/3, ratio 3/3
+and the 5 research tasks 5/5, no answer citing an unfetched page. The guard never had to
+fire: in 4 of these runs the NVIDIA PDF's fetch failed (before PDF reading), and none of
+them cited it.
+
 ## Development
 
 ```powershell

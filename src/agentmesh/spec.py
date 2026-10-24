@@ -107,6 +107,9 @@ class AgentSpec(BaseModel):
     # A tool name (Research: "fetch_url"): every number in the final answer must appear in
     # one of that tool's successful results or in the task, else the answer is sent back.
     check_numbers: str | None = None
+    # A tool name (Research: "fetch_url"): every URL the final answer cites must be one that
+    # tool fetched successfully (or one the task gives), else the answer is sent back.
+    check_citations: str | None = None
     # qwen3's reasoning mode: slower, but needed for multi-step arithmetic.
     think: bool = False
     workspace: Path

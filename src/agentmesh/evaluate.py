@@ -214,9 +214,27 @@ def trace_stats(paths: list[Path]) -> dict[str, Any]:
                     url = (call.get("arguments") or {}).get("url")
                     if url:
                         s["fetched"].append(normalize_url(str(url)))
+                    # After a redirect the page's own URL differs from the one asked for
+                    # (NVIDIA's model card PDF moves to developer.download.nvidia.com), and
+                    # an answer may cite either.
+                    final = _result_url(ev.get("output"))
+                    if final:
+                        s["fetched"].append(normalize_url(final))
     s["tools"] = dict(s["tools"])
     s["fetched"] = list(dict.fromkeys(s["fetched"]))
     return s
+
+
+def _result_url(output: Any) -> str | None:
+    """The ``url`` field of a ``fetch_url`` result (the URL after redirects), if any."""
+    if not isinstance(output, str):
+        return None
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError:
+        return None
+    url = data.get("url") if isinstance(data, dict) else None
+    return url if isinstance(url, str) and url else None
 
 
 # --- one run ---------------------------------------------------------------------------

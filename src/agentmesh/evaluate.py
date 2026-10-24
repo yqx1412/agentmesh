@@ -48,6 +48,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agentmesh.client import TaskRun, ask, cancel
 from agentmesh.orchestrator import Chat, Orchestration, RunPolicy, orchestrate
+from agentmesh.urls import normalize_url, urls_in
 
 SYSTEMS = ("single", "multi")
 
@@ -167,21 +168,6 @@ def score(task: EvalTask, answer: str) -> list[dict[str, Any]]:
 
 
 # --- traces ----------------------------------------------------------------------------
-
-_URL = re.compile(r"https?://[^\s\]\[)(<>\"'`,|]+")
-
-
-def normalize_url(url: str) -> str:
-    url = url.strip().rstrip(".;:!?*_")
-    url = url.split("#", 1)[0]
-    scheme, _, rest = url.partition("://")
-    host, slash, path = rest.partition("/")
-    path = path.rstrip("/")
-    return f"{scheme.lower()}://{host.lower()}{slash if path else ''}{path}"
-
-
-def urls_in(text: str) -> list[str]:
-    return list(dict.fromkeys(normalize_url(u) for u in _URL.findall(text)))
 
 
 def find_traces(trace_root: Path, task_ids: list[str]) -> list[Path]:

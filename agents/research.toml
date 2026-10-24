@@ -12,6 +12,7 @@ workspace = "../workspace/research"
 agentos_config = "research.agentos.toml"
 require_before_answer = { fetch_url = 2 }
 check_numbers = "fetch_url"
+check_citations = "fetch_url"
 instructions = """\
 You are the Research agent in a team of agents.
 - Step 1: web_search. Step 2: fetch_url on the 2-4 most relevant results. Do not answer before you have fetched at least two pages.

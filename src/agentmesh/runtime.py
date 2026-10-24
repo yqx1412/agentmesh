@@ -116,33 +116,65 @@ def _page_text(content: str) -> str:
 
 
 def unfetched_numbers(answer: str, messages: list[Message], fetch_tool: str) -> list[str]:
-    """Numbers in ``answer`` that no successful ``fetch_tool`` result contains and the
-    user's message doesn't give. Search snippets don't count: they are not sources.
+    """Numbers in ``answer`` that the user's message doesn't give and no fetched page
+    behind them contains. Search snippets don't count: they are not sources.
+
+    Which pages count: on a line that cites URLs (one of Research's claims), the fetched
+    pages that line cites; elsewhere (the summary), the fetched pages the answer cites
+    anywhere, or every fetched page when it cites none of them.
 
     Live, Research reported Qwen3-8B's head dimension as 5,120, a number its one fetched
-    page (the model card, which doesn't give a head dimension) never mentions."""
-    pages = [
-        _page_text(m.content.removeprefix("ERROR:"))
-        for m in messages
-        if m.role == "tool" and _matches(m.tool_name, fetch_tool)
-    ]
-    if not pages:
+    page (the model card, which doesn't give a head dimension) never mentions. In the
+    2026-10-23b M6 rerun a claim gave Ollama's default context as 4,096, citing a page
+    Research never fetched; the check passed because 4096 is also Qwen3-8B's hidden_size,
+    in the config.json fetched with the card another claim cited."""
+    results = _fetch_results(messages, fetch_tool)
+    if not results:
         return []  # nothing fetched yet: the required-calls check asks for fetches
+    ok = [(urls, text) for urls, text, good in results if good]
+    # Always allowed: the task's numbers, and a failed fetch's error ("HTTP 403").
+    base = _numbers_in([text for _, text, good in results if not good])
+    for m in messages:
+        if m.role == "user":
+            base |= numbers(m.content).keys()
+
+    def on(cited: set[str]) -> set:
+        return _numbers_in([text for urls, text in ok if urls & cited])
+
+    def cites(text: str) -> set[str]:
+        return {u for u in urls_in(text) if not _is_local(u)}  # "http://localhost:11434"
+
+    everywhere = cites(answer)
+    rest = (
+        on(everywhere)
+        if any(urls & everywhere for urls, _ in ok)
+        else _numbers_in([text for _, text in ok])
+    )
+    bad: dict = {}
+    for line in answer.splitlines():
+        cited = cites(line)
+        seen = base | (on(cited) if cited else rest)
+        for v, t in numbers(line).items():
+            if v not in seen and v not in TRIVIAL:
+                bad.setdefault(v, t)
+    return list(bad.values())
+
+
+def _numbers_in(pages: list[str]) -> set:
     seen: set = set()
-    for p in pages:  # a failed fetch's text is its error ("HTTP 403"), which may be quoted
+    for p in pages:
         seen |= numbers(p).keys()
         # "4k context" states 4,096 (or 4,000) tokens.
         for m in _THOUSANDS.finditer(p):
             seen |= {Decimal(m.group(1)) * 1000, Decimal(m.group(1)) * 1024}
-    for m in messages:
-        if m.role == "user":
-            seen |= numbers(m.content).keys()
-    return [t for v, t in numbers(answer).items() if v not in seen and v not in TRIVIAL]
+    return seen
 
 
-def fetched_urls(messages: list[Message], fetch_tool: str) -> set[str]:
-    """Normalized URLs of every successful ``fetch_tool`` call: the URL asked for and the
-    page's own URL after redirects (fetch_url's result has a ``url`` field)."""
+def _fetch_results(messages: list[Message], fetch_tool: str) -> list[tuple[set[str], str, bool]]:
+    """Each ``fetch_tool`` result as (the URLs it was fetched under, its page text, whether
+    it succeeded). The URLs are the one asked for, the page's own URL after redirects
+    (fetch_url's result has a ``url`` field) and, for a Hugging Face card fetched with its
+    config.json, both parts' URLs."""
     asked = {
         tc.id: tc.arguments.get("url")
         for m in messages
@@ -150,28 +182,37 @@ def fetched_urls(messages: list[Message], fetch_tool: str) -> set[str]:
         for tc in m.tool_calls or []
         if _matches(tc.name, fetch_tool) and isinstance(tc.arguments, dict)
     }
-    seen: set[str] = set()
+    out = []
     for m in messages:
         if m.role != "tool" or not _matches(m.tool_name, fetch_tool):
             continue
         if m.content.startswith("ERROR:"):
+            out.append((set(), _page_text(m.content.removeprefix("ERROR:")), False))
             continue
+        urls: set[str] = set()
         url = asked.get(m.tool_call_id or "")
         if isinstance(url, str) and url:
-            seen |= _cited_form(url)
+            urls |= _cited_form(url)
         try:
             data = json.loads(m.content)
         except json.JSONDecodeError:
-            continue
-        final = data.get("url") if isinstance(data, dict) else None
-        if isinstance(final, str) and final:
-            seen |= _cited_form(final)
-        # A fetched Hugging Face card carries its config.json and the other way round, each
-        # under a "[..., from <url>]" heading (webtools.with_model_config).
-        text = data.get("text") if isinstance(data, dict) else None
-        if isinstance(text, str):
-            seen |= {normalize_url(u) for u in _PART_FROM.findall(text)}
-    return seen
+            data = None
+        if isinstance(data, dict):
+            final = data.get("url")
+            if isinstance(final, str) and final:
+                urls |= _cited_form(final)
+            # A fetched Hugging Face card carries its config.json and the other way round,
+            # each under a "[..., from <url>]" heading (webtools.with_model_config).
+            text = data.get("text")
+            if isinstance(text, str):
+                urls |= {normalize_url(u) for u in _PART_FROM.findall(text)}
+        out.append((urls, _page_text(m.content), True))
+    return out
+
+
+def fetched_urls(messages: list[Message], fetch_tool: str) -> set[str]:
+    """Normalized URLs of every successful ``fetch_tool`` call (see ``_fetch_results``)."""
+    return {u for urls, _, good in _fetch_results(messages, fetch_tool) if good for u in urls}
 
 
 _PART_FROM = re.compile(r"^\[[^\]\n]*, from (https?://[^\s\]]+)\]$", re.M)
@@ -264,11 +305,12 @@ class AnswerGuardLLM:
             bad = unfetched_numbers(answer, messages, self.check_numbers)
             if bad:
                 return (
-                    f"These numbers in your answer are in no page you fetched: "
-                    f"{', '.join(bad)}. Report a value only when a fetched page states it. "
-                    "Fetch a page that does (a model's architecture values such as its head "
-                    "dimension are in its config.json, which comes first when you fetch its "
-                    "Hugging Face page, https://huggingface.co/<org>/<model>), or say "
+                    f"These numbers in your answer are not on the fetched pages cited for "
+                    f"them: {', '.join(bad)}. Report a value only when a fetched page states "
+                    "it, and cite that page on the same claim. Fetch a page that does (a "
+                    "model's architecture values such as its head dimension are in its "
+                    "config.json, which comes first when you fetch its Hugging Face page, "
+                    "https://huggingface.co/<org>/<model>), or say "
                     "plainly that you could not find the value. Then rewrite the answer."
                 )
         if self.check_citations:

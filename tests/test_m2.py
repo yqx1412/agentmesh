@@ -205,8 +205,9 @@ def test_unfetched_numbers():
     assert unfetched_numbers(answer, msgs, "fetch_url") == ["5120"]
     # "4k" on a page states 4,096; the task's own numbers and 0-2 don't need a page;
     # numbers in URLs and model names aren't values.
-    ok = "Ollama: 4,096 tokens below 24 GiB, 1 window, x2. See https://x.io/v3/123 (Qwen3-8B)"
+    ok = "Ollama: 4,096 tokens below 24 GiB, 1 window, x2 (Qwen3-8B)."
     assert unfetched_numbers(ok, msgs, "fetch_url") == []
+    assert unfetched_numbers("See https://x.io/v3/123", msgs, "fetch_url") == []
     # Search snippets are not pages, and nothing fetched yet means nothing to check.
     snippet = tool_msg("web__web_search", '{"results": [{"snippet": "head_dim 5120"}]}')
     assert unfetched_numbers("5120", [snippet, CARD], "fetch_url") == ["5120"]
@@ -306,6 +307,43 @@ def test_citation_guard_sends_unfetched_citation_back_and_survives_compaction():
     assert "did not fetch successfully" in inner.seen[-1][-1].content
     # Off unless the spec names the fetch tool.
     assert AnswerGuardLLM(ScriptedLLM([bad])).chat([task], []).message is bad
+
+
+def test_unfetched_numbers_reads_the_pages_each_claim_cites():
+    # The 2026-10-23b rerun: claim 1 gave Ollama's 4,096 citing ssdnodes.com (never
+    # fetched). 4096 is also Qwen3-8B's hidden_size, in the config.json fetched with the
+    # card claim 2 cites, so a check against every fetched page passed it.
+    task = Message(role="user", content="Ollama's default context below 24 GiB, and Qwen3-8B's?")
+    card = "https://huggingface.co/Qwen/Qwen3-8B"
+    paired = _fetch(
+        card,
+        json.dumps(
+            {
+                "url": card,
+                "text": f"[This model's config.json, from {card}/blob/main/config.json]\n"
+                f'{{"hidden_size": 4096}}\n\n[The model card, from {card}]\n'
+                "Context Length: 32,768 natively",
+            }
+        ),
+        "a",
+    )
+    other = _fetch("https://therouter.ai/q", '{"text": "Qwen3-8B: 32,768 tokens"}', "b")
+    msgs = [task, *paired, *other]
+    answer = (
+        "Summary: Ollama uses 4,096 tokens; Qwen3-8B has 32,768.\n"
+        "1. Ollama's default is 4,096 tokens. [https://www.ssdnodes.com/learn/x]\n"
+        f"2. Qwen3-8B's native context is 32,768 tokens. [{card}]\n"
+    )
+    assert unfetched_numbers(answer, msgs, "fetch_url") == ["4,096"]
+    # Citing the page that states it passes; so does the summary, whose numbers may come
+    # from any page the answer cites.
+    fixed = answer.replace("[https://www.ssdnodes.com/learn/x]", f"[{card}/blob/main/config.json]")
+    assert unfetched_numbers(fixed, msgs, "fetch_url") == []
+    # A claim citing a fetched page that lacks its number fails, even if another page has it.
+    wrong = "1. Qwen3-8B: 32,768 tokens [https://therouter.ai/q]\n2. Head dim 4096 [https://therouter.ai/q]"
+    assert unfetched_numbers(wrong, msgs, "fetch_url") == ["4096"]
+    # No citation at all: any fetched page counts, as before. Local addresses aren't citations.
+    assert unfetched_numbers("Ollama: 4096 on http://localhost:11434", msgs, "fetch_url") == []
 
 
 def test_research_checks_citations():

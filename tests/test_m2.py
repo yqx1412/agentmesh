@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -18,6 +19,7 @@ from agentmesh.runtime import (
     missing_calls,
     select_tools,
     system_prompt,
+    unfetched_citations,
     unfetched_numbers,
 )
 from agentmesh.spec import AgentSpec, SkillSpec, SpecError, load_spec
@@ -228,6 +230,86 @@ def test_number_guard_sends_unfetched_number_back():
 
 def test_research_checks_numbers():
     assert load_spec(AGENTS / "research.toml").check_numbers == "fetch_url"
+
+
+def _fetch(url: str, content: str, call_id: str) -> list[Message]:
+    """An assistant fetch_url call and its tool result, as the agent's history holds them."""
+    call = ToolCall(id=call_id, name="web__fetch_url", arguments={"url": url})
+    return [
+        Message(role="assistant", content="", tool_calls=[call]),
+        Message(role="tool", content=content, tool_name="web__fetch_url", tool_call_id=call_id),
+    ]
+
+
+PDF_URL = "https://developer.nvidia.com/downloads/assets/ace/model_card/qwen3-8b-instruct.pdf"
+
+
+def test_unfetched_citations():
+    task = Message(role="user", content="Qwen3-8B's license? Start at https://qwenlm.github.io/")
+    hf = _fetch(
+        "https://huggingface.co/Qwen/Qwen3-8B",
+        '{"url": "https://huggingface.co/Qwen/Qwen3-8B", "text": "x"}',
+        "a",
+    )
+    # The 2026-10-23b rerun: the PDF's fetch failed, and the answer cited it anyway.
+    pdf = _fetch(PDF_URL, "ERROR: unsupported content type 'application/pdf'", "b")
+    msgs = [task, *hf, *pdf]
+    answer = f"Apache 2.0 [https://huggingface.co/Qwen/Qwen3-8B/], 32,768 tokens [{PDF_URL}]."
+    assert unfetched_citations(answer, msgs, "fetch_url") == [PDF_URL]
+    # Never fetched at all (the ssdnodes citation), versus the task's own URL and a local
+    # address the answer reports as a value.
+    other = "Default 4096 [https://www.ssdnodes.com/learn/x]. Ollama: http://localhost:11434"
+    assert unfetched_citations(other + " https://qwenlm.github.io", msgs, "fetch_url") == [
+        "https://www.ssdnodes.com/learn/x"
+    ]
+
+
+def test_unfetched_citations_accepts_redirects_and_paired_pages():
+    final = "https://developer.download.nvidia.com/assets/ace/model_card/Qwen3-8B-Instruct.pdf"
+    redirected = _fetch(PDF_URL, json.dumps({"url": final, "text": "Context Length: 32,768"}), "a")
+    paired = _fetch(
+        "https://huggingface.co/Qwen/Qwen3-8B/resolve/main/config.json",
+        json.dumps(
+            {
+                "url": "https://huggingface.co/Qwen/Qwen3-8B/resolve/main/config.json",
+                "text": "[This model's config.json, from https://huggingface.co/Qwen/Qwen3-8B/"
+                "blob/main/config.json]\n{}\n\n[The model card, from "
+                "https://huggingface.co/Qwen/Qwen3-8B]\nApache 2.0",
+            }
+        ),
+        "b",
+    )
+    comma = _fetch("https://llm-explorer.com/model/Qwen/Qwen3-8B,6sQs", '{"text": "x"}', "c")
+    answer = (
+        f"[{PDF_URL}] [{final}] https://huggingface.co/Qwen/Qwen3-8B "
+        "https://huggingface.co/Qwen/Qwen3-8B/blob/main/config.json "
+        "https://llm-explorer.com/model/Qwen/Qwen3-8B,6sQs"
+    )
+    assert unfetched_citations(answer, [*redirected, *paired, *comma], "fetch_url") == []
+
+
+def test_citation_guard_sends_unfetched_citation_back_and_survives_compaction():
+    task = Message(role="user", content="Qwen3-8B's license?")
+    hf = _fetch("https://huggingface.co/Qwen/Qwen3-8B", '{"text": "Apache 2.0"}', "a")
+    bad = Message(role="assistant", content=f"Apache 2.0 [{PDF_URL}]")
+    good = Message(role="assistant", content="Apache 2.0 [https://huggingface.co/Qwen/Qwen3-8B]")
+    step = Message(
+        role="assistant", content="", tool_calls=[ToolCall(id="z", name="x", arguments={})]
+    )
+    inner = ScriptedLLM([step, bad, good])
+    guard = AnswerGuardLLM(inner, check_citations="fetch_url")
+    guard.chat([task, *hf], [])  # a step that saw the fetch
+    # Compacted: the fetch's messages are gone from the history the final call sees.
+    resp = guard.chat([task, Message(role="user", content="Summary of earlier steps.")], [])
+    assert resp.message is good
+    assert PDF_URL in inner.seen[-1][-1].content
+    assert "did not fetch successfully" in inner.seen[-1][-1].content
+    # Off unless the spec names the fetch tool.
+    assert AnswerGuardLLM(ScriptedLLM([bad])).chat([task], []).message is bad
+
+
+def test_research_checks_citations():
+    assert load_spec(AGENTS / "research.toml").check_citations == "fetch_url"
 
 
 def test_web_search_drops_empty_hits_ranks_model_pages_first(monkeypatch):

@@ -503,6 +503,15 @@ The last failing ratio run had no such hit and took 40,960 from a context-window
 Live, the fleet passed the ratio, KV and five research tasks 21/21 (3 each); the lookup
 fired in all 3 ratio runs, whose searches again returned no Hugging Face page.
 
+`fetch_url` now reads PDFs (`pypdf`, text layer only, first 40 pages). It used to refuse
+`application/pdf`, and in the next full rerun two license answers cited NVIDIA's Qwen3-8B
+model card PDF after its fetch had failed. A scanned or unreadable PDF is still an error.
+The eval also counts a fetched page under its URL after redirects: that PDF moves to
+`developer.download.nvidia.com`, and an answer citing the final URL was scored as citing
+an unfetched page. Re-scored from their traces, M6 and both published reruns are
+unchanged. Live, fleet only: license 3/3, all three reading the PDF, and KV cache 3/3,
+every cited page fetched.
+
 ## Development
 
 ```powershell

@@ -30,6 +30,7 @@ MAX_REDIRECTS = 5
 DEFAULT_CHARS = 8_000
 MAX_CHARS = 20_000
 MIN_RESULTS = 5
+MAX_PDF_PAGES = 40
 TEXT_TYPES = ("text/plain", "text/markdown", "text/csv", "application/json", "text/x-")
 
 Resolver = Callable[[str, int], list[str]]
@@ -98,7 +99,46 @@ def _mark_paragraphs(raw: str) -> str:
     return lxml_html.tostring(tree, encoding="unicode")
 
 
+def _is_pdf(body: bytes, content_type: str, url: str) -> bool:
+    if content_type.startswith("application/pdf"):
+        return True
+    # Some servers send PDFs as application/octet-stream; trust the file's own magic bytes.
+    return content_type.startswith("application/octet-stream") and body[:5] == b"%PDF-"
+
+
+def _pdf_to_text(body: bytes) -> tuple[str | None, str]:
+    """Extract the text layer of a PDF, at most ``MAX_PDF_PAGES`` pages.
+
+    Model cards and papers are often PDFs (NVIDIA's Qwen3-8B card is one). A scanned PDF
+    with no text layer, or one pypdf can't parse, is an error rather than empty text, so
+    the agent knows it has read nothing.
+    """
+    import io
+
+    from pypdf import PdfReader
+    from pypdf.errors import PdfReadError
+
+    try:
+        reader = PdfReader(io.BytesIO(body))
+        if reader.is_encrypted:
+            raise ToolError("PDF is encrypted")
+        pages = reader.pages[:MAX_PDF_PAGES]
+        text = "\n\n".join((p.extract_text() or "").strip() for p in pages).strip()
+        title = None
+        if reader.metadata is not None and reader.metadata.title:
+            title = str(reader.metadata.title).strip() or None
+    except (PdfReadError, ValueError, KeyError, TypeError) as exc:
+        raise ToolError(f"cannot read PDF: {type(exc).__name__}: {exc}") from exc
+    if not text:
+        raise ToolError("PDF has no extractable text (scanned images?)")
+    if len(reader.pages) > MAX_PDF_PAGES:
+        text += f"\n\n[only the first {MAX_PDF_PAGES} of {len(reader.pages)} pages were read]"
+    return title, text
+
+
 def _to_text(body: bytes, content_type: str, url: str) -> tuple[str | None, str]:
+    if _is_pdf(body, content_type, url):
+        return _pdf_to_text(body)
     charset = "utf-8"
     if "charset=" in content_type:
         charset = content_type.split("charset=", 1)[1].split(";", 1)[0].strip() or "utf-8"
@@ -137,7 +177,10 @@ def fetch_page(
         transport=transport,
         timeout=timeout,
         follow_redirects=False,
-        headers={"User-Agent": USER_AGENT, "Accept": "text/html,text/plain;q=0.9,*/*;q=0.5"},
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,text/plain;q=0.9,application/pdf;q=0.8,*/*;q=0.5",
+        },
     ) as client:
         for _ in range(MAX_REDIRECTS + 1):
             check_url(current, resolve)

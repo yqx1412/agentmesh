@@ -540,6 +540,17 @@ fires on 10 more than before, each a value cited to a page that doesn't state it
 correct head dimension of 128 cited to the card instead of `config.json`). Live, fleet
 only: ratio 3/3 and KV cache 3/3, every cited page fetched.
 
+Every answer a check sends back is now in the agent's trace, as an `answer_sent_back`
+event: which check (`empty`, `required_calls`, `quotes`, `numbers` or `citations`), what it
+flagged, the refused reply and its tokens. Before, the trace had only the reply the agent
+kept, so whether a check had fired couldn't be told afterwards. `agentmesh eval` counts
+them per run (`sent_back` in `results.jsonl`, an "Answers sent back by a check" row in the
+report) and counts each refused reply as a model call. Live, research, verification and
+composite tasks once each on both systems: 5 send-backs in 4 of the fleet's 9 runs, all
+`required_calls` (Research answering before its two fetches 3 times, the Analyst
+answering without `run_python` twice), none from the citation or number checks; the
+single agent's guard sent nothing back.
+
 ## Development
 
 ```powershell

@@ -540,6 +540,22 @@ fires on 10 more than before, each a value cited to a page that doesn't state it
 correct head dimension of 128 cited to the card instead of `config.json`). Live, fleet
 only: ratio 3/3 and KV cache 3/3, every cited page fetched.
 
+**Third full M6 rerun** (2026-10-24, same tasks and settings, on `84a7c26` with every fix
+above; details in the [write-up](benchmarks/results/m6-single-vs-multi.md#third-rerun-2026-10-24),
+raw data in `benchmarks/results/m6-rerun-3/`):
+
+| | single | multi |
+|---|---|---|
+| Runs passed | 33/48 (second rerun: 36) | 48/48 (second rerun: 48) |
+| Passed, every cited page fetched | 26/48 (26) | 48/48 (48) |
+| Composite | 5/9 (5) | 9/9 (9) |
+| Median time / mean tokens | 31 s / 5.5k | 40 s / 14.6k |
+
+The unpublished rerun before the last three fixes had 45/48 with every cited page
+fetched; this one has 48/48. Research's kept answers all pass the new checks, but this
+run's traces predate send-back logging (below), so it isn't known whether the checks
+fired live.
+
 Every answer a check sends back is now in the agent's trace, as an `answer_sent_back`
 event: which check (`empty`, `required_calls`, `quotes`, `numbers` or `citations`), what it
 flagged, the refused reply and its tokens. Before, the trace had only the reply the agent

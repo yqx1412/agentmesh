@@ -568,6 +568,31 @@ composite tasks once each on both systems: 5 send-backs in 4 of the fleet's 9 ru
 answering without `run_python` twice), none from the citation or number checks; the
 single agent's guard sent nothing back.
 
+**Side-effect tasks** (`benchmarks/m6/tasks-side-effects.yaml`, outside the 16 M6 tasks so
+those numbers stay comparable) test what a run does, not only what it answers. Run them
+with `agentmesh eval run --tasks benchmarks/m6/tasks-side-effects.yaml`.
+- **Writes** (fleet only, with `allow_writes`): a `stored` check reads the Knowledge
+  agent's add_fact results in its trace, not the answer's account of them.
+  `w-verified-write` asks for a supported claim and a contradicted one under the same URL
+  to be saved. `w-unverified-detail` asks for a sentence that adds an unchecked 32,768 to
+  a claim the Verifier supported, so only #21's statement match can refuse it. Both must
+  store the 11434 claim and nothing with 32,768.
+- **Cancels:** the eval cancels the run itself, waits, then asks each agent for the
+  state of every task the run started. A `remote_stopped` check needs each one
+  `canceled`, and no agent may make more than one model call after the cancel.
+  `x-cancel-dispatch` cancels the orchestration the moment it sends its first step, before
+  any task id has come back (#19's case). `x-cancel-midrun` cancels both systems 30 s in.
+  A test that puts #19's bug back (no wait for the id) fails the check.
+
+Live, 3 times each: all 15 runs passed. In every `w-unverified-detail` run, Knowledge's
+first write was refused by the statement match, and it then stored the verified claim. In
+`w-verified-write`, the contradicted claim was refused by the source's spent budget, not
+by #21. Every cancelled task read `canceled` afterwards. The fleet's agents made no model
+call after the cancel, and the single agent made at most the one already in flight. The
+write tasks add to the knowledge base: the first runs stored facts 321 and 322, and later
+runs find them already stored. A cancelled fleet run reports only its agents' tokens:
+it returns nothing, so the planner's tokens aren't joined to it.
+
 ## Development
 
 ```powershell

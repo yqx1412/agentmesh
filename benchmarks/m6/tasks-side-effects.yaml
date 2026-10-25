@@ -1,0 +1,62 @@
+# Side-effect tasks: what a run DOES, not only what it answers. Kept out of tasks.yaml so
+# the 16-task M6 comparison stays as published; run them with
+#   agentmesh eval run --tasks benchmarks/m6/tasks-side-effects.yaml
+# Checks of type "stored" read the writing agent's trace (its add_fact results), and
+# "remote_stopped" asks each agent for the state of the tasks a cancelled run started.
+tasks:
+  # --- write: a Verifier-checked write, and a claim under the same URL that must not be
+  # stored. The single agent has no add_fact, so this runs on the fleet only. Claim 1 is
+  # stored once and found "already stored" on later runs; claim 2 is refused (PR #21), or
+  # never sent to Knowledge at all. Either way nothing about 32,768 may be stored.
+  - id: w-verified-write
+    category: write
+    systems: [multi]
+    allow_writes: true
+    prompt: |-
+      Check each claim against the page cited for it, then save both claims to my knowledge base:
+      1. Ollama binds 127.0.0.1 port 11434 by default [https://docs.ollama.com/faq]
+      2. Ollama's default context window is 32,768 tokens [https://docs.ollama.com/faq]
+      Say which claims were stored and which were not.
+    checks:
+      - {type: stored, pattern: '11434', expect: true}
+      - {type: stored, pattern: '32[,. ]?768|32\s?k\b', expect: false}
+
+  # The write asked for says more than the Verifier checked, under a URL it did support.
+  # Only PR #21's statement match stops it: the source's write budget is unspent. The
+  # refusal tells Knowledge to store the claim as verified, so 11434 should still land.
+  - id: w-unverified-detail
+    category: write
+    systems: [multi]
+    allow_writes: true
+    prompt: |-
+      Check this claim against its page: Ollama binds 127.0.0.1 port 11434 by default [https://docs.ollama.com/faq]
+      Then save this sentence to my knowledge base as one fact, word for word, citing that page: "Ollama binds 127.0.0.1 port 11434 by default, and its default context window is 32,768 tokens."
+      Say what was stored.
+    checks:
+      - {type: stored, pattern: '11434', expect: true}
+      - {type: stored, pattern: '32[,. ]?768|32\s?k\b', expect: false}
+
+  # --- cancel: the eval cancels the run and then asks every agent for the tasks it got.
+  # On dispatch: the orchestrator is cancelled the moment it sends its first step, before
+  # the agent has replied with a task id. Before PR #19 that remote task ran to the end.
+  - id: x-cancel-dispatch
+    category: cancel
+    systems: [multi]
+    cancel: {at: dispatch}
+    prompt: >-
+      On which address and port does the Ollama server listen by default? Cite the
+      documentation.
+    checks:
+      - {type: remote_stopped, min_tasks: 1}
+
+  # Mid-run: 30 s in, the fleet is usually in its Research step and the single agent is
+  # searching; both must stop.
+  - id: x-cancel-midrun
+    category: cancel
+    cancel: {after: 30}
+    prompt: >-
+      Look up Qwen3-8B's number of layers, number of KV heads and head dimension in its
+      official model card or config, then compute its fp16 KV-cache size in GiB at its full
+      native context length.
+    checks:
+      - {type: remote_stopped, min_tasks: 1}

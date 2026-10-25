@@ -187,6 +187,7 @@ def trace_stats(paths: list[Path]) -> dict[str, Any]:
         "tool_calls": 0,
         "tool_errors": 0,
         "tools": Counter(),
+        "sent_back": Counter(),
         "fetched": [],
     }
     for p in paths:
@@ -199,7 +200,12 @@ def trace_stats(paths: list[Path]) -> dict[str, Any]:
             except json.JSONDecodeError:
                 continue
             kind = ev.get("event")
-            if kind == "llm_response":
+            if kind == "answer_sent_back":
+                # A reply an answer guard refused: a model call of its own (its tokens are
+                # already folded into the llm_response of the reply the agent kept).
+                s["llm_calls"] += 1
+                s["sent_back"][str(ev.get("check", "?"))] += 1
+            elif kind == "llm_response":
                 s["llm_calls"] += 1
                 s["prompt_tokens"] += int(ev.get("prompt_tokens") or 0)
                 s["completion_tokens"] += int(ev.get("completion_tokens") or 0)
@@ -221,6 +227,7 @@ def trace_stats(paths: list[Path]) -> dict[str, Any]:
                     if final:
                         s["fetched"].append(normalize_url(final))
     s["tools"] = dict(s["tools"])
+    s["sent_back"] = dict(s["sent_back"])
     s["fetched"] = list(dict.fromkeys(s["fetched"]))
     return s
 
@@ -258,6 +265,8 @@ class RunRecord(BaseModel):
     tool_calls: int = 0
     tool_errors: int = 0
     tools: dict[str, int] = Field(default_factory=dict)
+    # answers an agent's guard sent back, by check (see runtime.AnswerGuardLLM)
+    sent_back: dict[str, int] = Field(default_factory=dict)
     # multi only: the plan, and the A2A tasks the orchestrator sent (attempts included)
     plan: list[str] = Field(default_factory=list)
     agent_tasks: int = 0
@@ -300,6 +309,7 @@ def finish_record(rec: RunRecord, task: EvalTask, trace_root: Path) -> RunRecord
     rec.llm_calls = st["llm_calls"]
     rec.prompt_tokens, rec.completion_tokens = st["prompt_tokens"], st["completion_tokens"]
     rec.tool_calls, rec.tool_errors, rec.tools = st["tool_calls"], st["tool_errors"], st["tools"]
+    rec.sent_back = st["sent_back"]
     rec.fetched = st["fetched"]
     if task.cites:
         rec.cited = urls_in(rec.answer)
@@ -550,6 +560,18 @@ def report(results: list[RunRecord], tasks: list[EvalTask] | None = None) -> str
         return f"{len(bad)} of {len(cited)}"
 
     row("Runs citing an unfetched page", cites)
+
+    def sent_back(rs: list[RunRecord]) -> str:
+        by_check: Counter[str] = Counter()
+        for r in rs:
+            by_check.update(r.sent_back)
+        runs = sum(bool(r.sent_back) for r in rs)
+        if not runs:
+            return "none"
+        detail = ", ".join(f"{k} {v}" for k, v in sorted(by_check.items()))
+        return f"{runs} runs ({detail})"
+
+    row("Answers sent back by a check", sent_back)
     row(
         "Failures",
         lambda rs: (

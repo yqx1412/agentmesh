@@ -7,7 +7,8 @@ import re
 from pathlib import Path
 
 import pytest
-from agentos.llm import ChatResponse, Message
+from agentos.agent import Tracer
+from agentos.llm import ChatResponse, Message, ToolCall
 from test_m3 import Fleet, ScriptedChat, plan, step
 
 from agentmesh.evaluate import (
@@ -242,6 +243,69 @@ def test_guard_reports_tokens_of_refused_replies():
     assert (resp.prompt_tokens, resp.completion_tokens) == (200, 14)
 
 
+def test_guard_writes_each_send_back_to_the_trace(tmp_path):
+    # In the 2026-10-24 rerun nothing in the traces said whether a check had refused an
+    # answer: the agent's trace only has the reply it keeps.
+    page = Message(
+        role="tool",
+        tool_name="web__fetch_url",
+        tool_call_id="f1",
+        content=json.dumps({"url": "https://a.example/", "text": "The port is 11434."}),
+    )
+    call = Message(
+        role="assistant",
+        tool_calls=[
+            ToolCall(id="f1", name="web__fetch_url", arguments={"url": "https://a.example/"})
+        ],
+    )
+    replies = [
+        "",  # empty
+        "Port 11434 [https://b.example/]",  # cites a page it didn't fetch
+        "Port 11434 [https://a.example/]",
+    ]
+
+    class Inner:
+        model = "m"
+
+        def chat(self, messages, tools):
+            return ChatResponse(
+                message=Message(role="assistant", content=replies.pop(0)),
+                prompt_tokens=100,
+                completion_tokens=7,
+            )
+
+    trace = tmp_path / "research" / "t-1.jsonl"
+    guard = AnswerGuardLLM(Inner(), check_citations="fetch_url", tracer=Tracer(trace))
+    resp = guard.chat([Message(role="user", content="q"), call, page], [])
+    assert resp.message.content == "Port 11434 [https://a.example/]"
+    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    assert [(e["event"], e["check"], e["nudge"]) for e in events] == [
+        ("answer_sent_back", "empty", 1),
+        ("answer_sent_back", "citations", 2),
+    ]
+    assert events[1]["flagged"] == ["https://b.example"]
+    assert events[1]["content"] == "Port 11434 [https://b.example/]"
+    assert (events[1]["prompt_tokens"], events[1]["completion_tokens"]) == (100, 7)
+    # The eval counts them, and each refused reply as a model call.
+    s = trace_stats([trace])
+    assert s["sent_back"] == {"empty": 1, "citations": 1}
+    assert s["llm_calls"] == 2
+
+
+def test_guard_without_a_tracer_or_a_refusal_writes_nothing(tmp_path):
+    trace = tmp_path / "t.jsonl"
+
+    class Inner:
+        model = "m"
+
+        def chat(self, messages, tools):
+            return ChatResponse(message=Message(role="assistant", content="fine"))
+
+    AnswerGuardLLM(Inner(), tracer=Tracer(trace)).chat([], [])
+    assert not trace.exists()
+    AnswerGuardLLM(Inner()).chat([], [])  # no tracer: nothing to write to
+
+
 # --- the two systems, in-process ---------------------------------------------------------
 
 
@@ -427,3 +491,8 @@ async def test_run_eval_streams_resumes_and_reports(tmp_path):
     assert "| Passed, every cited page fetched | 1/2 (50%) | 2/2 (100%) |" in text
     assert "multi passed more often on 1, less often on 0 and equally on 1" in text
     assert "| single | r-y | 0 | wrong |" in text
+    assert "| Answers sent back by a check | none | none |" in text
+    next(r for r in results if r.system == "multi").sent_back = {"citations": 2, "numbers": 1}
+    assert "| Answers sent back by a check | none | 1 runs (citations 2, numbers 1) |" in (
+        report(results, tasks)
+    )

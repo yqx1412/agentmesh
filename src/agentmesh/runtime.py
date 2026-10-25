@@ -250,6 +250,16 @@ def unfetched_citations(
     return [u for u in urls_in(answer) if u not in fetched and u not in given and not _is_local(u)]
 
 
+@dataclasses.dataclass(frozen=True)
+class SendBack:
+    """Why the guard refused a final answer: which check, what it flagged, and the message
+    the model gets in reply."""
+
+    check: str  # "empty" | "required_calls" | "quotes" | "numbers" | "citations"
+    flagged: list[str]
+    message: str
+
+
 class AnswerGuardLLM:
     """Sends an unacceptable final answer back to the model with a reminder.
 
@@ -259,6 +269,10 @@ class AnswerGuardLLM:
     message (not kept in
     the agent's history). After ``max_nudges`` the answer goes through anyway, so a tool that
     keeps failing can't trap the task.
+
+    With a ``tracer``, every refusal is written to the trace as an ``answer_sent_back``
+    event (the check, what it flagged, the refused reply and its tokens). The agent's own
+    trace only has the reply it keeps, so without this a send-back left no record.
     """
 
     def __init__(
@@ -270,6 +284,7 @@ class AnswerGuardLLM:
         check_numbers: str | None = None,
         check_citations: str | None = None,
         max_nudges: int = 3,
+        tracer: Tracer | None = None,
     ) -> None:
         self.inner = inner
         self.model = inner.model
@@ -280,48 +295,61 @@ class AnswerGuardLLM:
         self.fetched: set[str] = set()
         self.max_nudges = max_nudges
         self.nudges = 0
+        self.tracer = tracer
 
-    def _problem(self, answer: str, messages: list[Message]) -> str | None:
+    def _problem(self, answer: str, messages: list[Message]) -> SendBack | None:
         if not answer.strip():
-            return (
+            return SendBack(
+                "empty",
+                [],
                 "Your reply was empty. Do the task now: call the tools it needs, then reply "
-                "with the result."
+                "with the result.",
             )
         missing = missing_calls(messages, self.required)
         if missing:
             need = ", ".join(f"{n} more successful {t} call(s)" for t, n in missing.items())
-            return f"Not yet: before answering you need {need}. Call the tool now."
+            return SendBack(
+                "required_calls",
+                [f"{t} x{n}" for t, n in missing.items()],
+                f"Not yet: before answering you need {need}. Call the tool now.",
+            )
         if self.check_quotes:
             bad = invented_quotes(answer, messages)
             if bad:
                 listed = "; ".join(f'"{q}"' for q in bad)
-                return (
+                return SendBack(
+                    "quotes",
+                    bad,
                     "These quotes are not in any page you fetched: "
                     f"{listed}. Quote only text copied exactly from a fetched page. If no "
                     "passage supports or contradicts a claim, its verdict is NOT FOUND. "
-                    "Fetch again or read further if you need to, then rewrite the answer."
+                    "Fetch again or read further if you need to, then rewrite the answer.",
                 )
         if self.check_numbers:
             bad = unfetched_numbers(answer, messages, self.check_numbers)
             if bad:
-                return (
+                return SendBack(
+                    "numbers",
+                    bad,
                     f"These numbers in your answer are not on the fetched pages cited for "
                     f"them: {', '.join(bad)}. Report a value only when a fetched page states "
                     "it, and cite that page on the same claim. Fetch a page that does (a "
                     "model's architecture values such as its head dimension are in its "
                     "config.json, which comes first when you fetch its Hugging Face page, "
                     "https://huggingface.co/<org>/<model>), or say "
-                    "plainly that you could not find the value. Then rewrite the answer."
+                    "plainly that you could not find the value. Then rewrite the answer.",
                 )
         if self.check_citations:
             bad = unfetched_citations(answer, messages, self.check_citations, self.fetched)
             if bad:
-                return (
+                return SendBack(
+                    "citations",
+                    bad,
                     "You cite pages you did not fetch successfully: "
                     f"{', '.join(bad)}. Cite only pages whose fetch returned their text; a "
                     "search result or a fetch that failed is not a source. Fetch the page "
                     "now if you need it, or remove that citation and anything only it "
-                    "supports. Then rewrite the answer."
+                    "supports. Then rewrite the answer.",
                 )
         return None
 
@@ -339,9 +367,19 @@ class AnswerGuardLLM:
             if problem is None:
                 break
             self.nudges += 1
+            if self.tracer is not None:
+                self.tracer.emit(
+                    "answer_sent_back",
+                    check=problem.check,
+                    flagged=problem.flagged,
+                    nudge=self.nudges,
+                    content=resp.message.content,
+                    prompt_tokens=resp.prompt_tokens,
+                    completion_tokens=resp.completion_tokens,
+                )
             p_tok += resp.prompt_tokens
             c_tok += resp.completion_tokens
-            extra += [resp.message, Message(role="user", content=problem)]
+            extra += [resp.message, Message(role="user", content=problem.message)]
             resp = self.inner.chat([*messages, *extra], tools)
         if p_tok or c_tok:
             # M6: a refused reply still cost tokens; report them with the one the agent keeps.
@@ -446,6 +484,7 @@ def agentos_runner(spec: AgentSpec, trace_dir: Path | None = None) -> Runner:
                     policy=Policy(auto_approve=spec.allow),
                 )
                 model: Any = CancellableLLM(llm, flag)
+                tracer = ProgressTracer(trace, progress)
                 # Always guarded: an empty final answer is refused for every agent, and the
                 # spec's required tools and quote check are added where it asks for them.
                 model = AnswerGuardLLM(
@@ -454,13 +493,14 @@ def agentos_runner(spec: AgentSpec, trace_dir: Path | None = None) -> Runner:
                     check_quotes=spec.check_quotes,
                     check_numbers=spec.check_numbers,
                     check_citations=spec.check_citations,
+                    tracer=tracer,
                 )
                 agent = make_agent(
                     spec.kind,
                     model,
                     registry,
                     max_steps=spec.max_steps,
-                    tracer=ProgressTracer(trace, progress),
+                    tracer=tracer,
                     context_budget=int(0.75 * spec.num_ctx),
                 )
                 if isinstance(agent, Agent):

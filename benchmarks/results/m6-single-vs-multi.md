@@ -24,6 +24,11 @@ whose web tools got the fetch and search fixes too. 3 repeats is a small sample:
 evals of the composite tasks put the fleet at about 90-95% on them. See
 [Second rerun](#second-rerun-2026-10-23).
 
+**Update, 2026-10-24:** after PRs #19-#24 (PDF reading, and Research's citations and
+numbers checked in code), a third full rerun again passed 48/48 on the fleet with every
+cited page fetched, and 33/48 on the single agent. See
+[Third rerun](#third-rerun-2026-10-24).
+
 Raw data: [`m6/results.jsonl`](m6/results.jsonl) (one line per run, with the answer,
 check results, cost and fetched pages), [`m6/report.md`](m6/report.md) (all tables),
 [`m6/meta.json`](m6/meta.json). Tasks: [`../m6/tasks.yaml`](../m6/tasks.yaml).
@@ -337,6 +342,81 @@ replied only `RATIO: 8.0`, without the two values the task asked to look up (0/3
 - **Research reads live pages,** and two of the regressions between reruns came from the
   web side (a docs page's markup, a model card's header), not from the agents.
 - **No writes were possible**, as in the first rerun, and the earlier caveats still apply.
+
+## Third rerun (2026-10-24)
+
+The same 16 tasks, 3 repeats per system, timeouts and hardware, on `main` at `84a7c26`
+with nothing uncommitted. Both systems were restarted from that commit first. Raw data:
+[`m6-rerun-3/results.jsonl`](m6-rerun-3/results.jsonl),
+[`m6-rerun-3/report.md`](m6-rerun-3/report.md),
+[`m6-rerun-3/meta.json`](m6-rerun-3/meta.json).
+
+What changed since the second rerun:
+
+- a cancel that arrives before the remote task's id is known still cancels the remote
+  run (#19); DomainGraph retries Ollama embedding errors that may pass, such as the
+  runner crash of the first run (DomainGraph #10)
+- when no search hit is a Hugging Face model page, `web_search` asks the hub's own search
+  for the named model and puts its page first (#20)
+- a Verifier-signed knowledge write must state a claim the Verifier supported with that
+  source, not only cite the URL (#21)
+- `fetch_url` reads the text layer of PDFs (#22)
+- Research's answer goes back to it if it cites a URL no successful fetch returned (#23),
+  or if a claim's numbers are not on the fetched pages that claim cites (#24)
+- scoring: a fetched page also counts under its URL after redirects (#22). Re-scored from
+  their traces, the first run and both earlier reruns are unchanged.
+
+The single agent's spec did not change. It shares the web tools and DomainGraph, so #10,
+#20 and #22 apply to it too, but it has neither of Research's new checks.
+
+| | single, second rerun | multi, second rerun | single, now | multi, now |
+|---|---|---|---|---|
+| Runs passed | 36/48 | 48/48 | 33/48 | 48/48 |
+| Passed, every cited page fetched | 26/48 | 48/48 | 26/48 | 48/48 |
+| Checks passed | 63/78 | 78/78 | 61/78 | 78/78 |
+| Median / mean time per run | 34 / 42 s | 45 / 50 s | 31 / 38 s | 40 / 49 s |
+| Mean tokens per run | 6,066 | 15,895 | 5,472 | 14,635 |
+| Runs that cited an unfetched page | 12 of 12 | 0 of 19 | 13 of 13 | 0 of 20 |
+| Composite passed | 5/9 | 9/9 | 5/9 | 9/9 |
+
+**Fleet:** every task passed 3/3 again, and none of its 20 citing answers cited a page it
+hadn't fetched. Research got cheaper and faster (research tasks: 22.9k -> 17.4k tokens,
+median 40 s -> 36 s), so the fleet costs about 2.7x the single agent's tokens (2.6x in the
+second rerun). The composite tasks cost a little more (26.3k -> 28.7k tokens, median 95 s).
+In the traces, Research fetched NVIDIA's Qwen3-8B model card PDF twice and read it both
+times, and the hub lookup of #20 supplied the model card in all 3 ratio runs, whose
+searches again returned no Hugging Face page. Replaying the citation and number checks
+on the 21 answers Research kept, none would be sent back. This run's traces predate
+send-back logging (#25), so whether the checks sent any answer back during the run isn't
+known; that path is covered by the tests and by replays on saved runs. In an 18-run live
+check after #25, the fleet's 5 send-backs all came from the required-calls check.
+
+**One full rerun in between** isn't published here. On `43d932c` (after #19-#21 and
+DomainGraph #10) the fleet passed 48/48 with composites 9/9, but only 45/48 with every
+cited page fetched: two license answers cited the NVIDIA PDF after its fetch had failed,
+and one ratio answer cited ssdnodes.com, which Research never fetched, for Ollama's 4,096.
+All three answers were correct. The number check had let the 4,096 through because
+4096 is also Qwen3-8B's `hidden_size`, on a page another claim cited. #22-#24 came out of
+those three answers. The single agent passed 34/48 there.
+
+**Single agent:** 33 vs 36 passed is within what an unchanged agent varies by:
+`r-qwen-license` 3 -> 1 (two answers gave the license but not the context length) and
+`r-llama-draft` 1 -> 0. Its failures are the same kinds: all 13 citing answers cited a
+page it never fetched, it searched the lecture notes for the MCP question in 2 of 3 runs,
+no timestamp was in the right window on `k-table-doubling` (0/3), and on the ratio task
+it replied only `RATIO: 8.0` (0/3).
+
+**How to read it:**
+
+- **The fleet has passed 144 of 144 runs** across the last three full reruns, but the code
+  changed between them, the repeats aren't independent (the planner runs at temperature
+  0), and the last 10-run composite evals, before #19-#24, put it at about 90-95% on
+  chained tasks.
+- **The new checks weren't seen working live.** No kept answer needed them, so this rerun
+  shows they don't get in the way, not that they catch anything.
+- **Still not a fresh measurement,** and **no writes were possible**, so #21 wasn't
+  exercised; nothing cancels a run in the eval either (#19). The earlier caveats still
+  apply.
 
 ## Reproducing
 

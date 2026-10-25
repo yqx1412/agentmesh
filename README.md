@@ -523,9 +523,10 @@ citing pages never fetched (a failed PDF fetch twice, ssdnodes.com once). Over 5
 Research answers it would have fired on 16, all real: those 3, and earlier citations of
 pages whose fetch failed or never happened. On the 21 Research answers of the rerun before
 that (every cited page fetched) it fired on none. Live, fleet only: license 3/3, ratio 3/3
-and the 5 research tasks 5/5, no answer citing an unfetched page. The guard never had to
-fire: in 4 of these runs the NVIDIA PDF's fetch failed (before PDF reading), and none of
-them cited it.
+and the 5 research tasks 5/5, no kept answer citing an unfetched page. In 4 of these runs
+the NVIDIA PDF's fetch failed (before PDF reading), and no kept answer cited it; these
+traces predate send-back logging, so whether the guard sent an answer back first isn't
+known.
 
 The number check now reads the pages each claim cites. A number on a line that cites URLs
 (one of Research's claims) must be on a fetched page that line cites; the summary's

@@ -610,6 +610,20 @@ write tasks add to the knowledge base: the first runs stored facts 321 and 322, 
 runs find them already stored. A cancelled fleet run reports only its agents' tokens:
 it returns nothing, so the planner's tokens aren't joined to it.
 
+**What the guard reads, across compaction.** The checks decide a URL or number is the
+task's own when it appears in a user message, and count a page as fetched from the
+`fetch_url` results in the history. An agent compacts a long history into one *user*
+message holding the clipped older text, which breaks both: in a 2026-10-26 `c-ollama-ratio`
+run the summary carried Research's search hits, so the citation check took one
+(`neuralgist.com`) for a task URL and the number check took its "4,096" for a task number,
+while the fetched pages the answer should have been checked against were gone. The guard
+now reads a history of its own: the system prompt, the task message, and every tool call
+and result it has seen during the task (each kept once, by `tool_call_id` or object
+identity so two real results never merge and required-call counting is unchanged),
+including ones compaction has since dropped. The compaction summary and the guard's own
+send-back message count as neither task-given nor fetched, so a reworded summary can't
+launder a bad citation and a retry can't pass on the values the send-back named.
+
 ## Development
 
 ```powershell

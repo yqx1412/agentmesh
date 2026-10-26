@@ -233,17 +233,16 @@ def _is_local(url: str) -> bool:
         return False
 
 
-def unfetched_citations(
-    answer: str, messages: list[Message], fetch_tool: str, also_fetched: set[str] = frozenset()
-) -> list[str]:
-    """URLs ``answer`` cites that no successful ``fetch_tool`` call returned (``also_fetched``
-    adds fetches no longer in ``messages``). The task's own URLs don't count as citations.
+def unfetched_citations(answer: str, messages: list[Message], fetch_tool: str) -> list[str]:
+    """URLs ``answer`` cites that no successful ``fetch_tool`` call returned. The user
+    messages' URLs (the task's own) don't count as citations; the guard passes only the
+    task's message, see ``AnswerGuardLLM._history``.
 
     In the 2026-10-23b M6 rerun, two Research answers cited NVIDIA's model card PDF after
     its fetch had failed ("unsupported content type"), and one cited ssdnodes.com, which
     Research never fetched. Only a prompt rule asked for fetched citations."""
     given = {u for m in messages if m.role == "user" for u in urls_in(m.content)}
-    fetched = fetched_urls(messages, fetch_tool) | also_fetched
+    fetched = fetched_urls(messages, fetch_tool)
     return [u for u in urls_in(answer) if u not in fetched and u not in given and not _is_local(u)]
 
 
@@ -289,10 +288,42 @@ class AnswerGuardLLM:
         self.check_quotes = check_quotes
         self.check_numbers = check_numbers
         self.check_citations = check_citations
-        self.fetched: set[str] = set()
+        # Every tool call and result seen in this task, oldest first, keyed by a stable
+        # per-message identity so two distinct results are never merged (one guard serves
+        # one task). See _history.
+        self.seen: dict[object, Message] = {}
         self.max_nudges = max_nudges
         self.nudges = 0
         self.tracer = tracer
+
+    def _history(self, messages: list[Message]) -> list[Message]:
+        """What the checks read: the system prompt, the task, and every tool call and result
+        this guard has seen during the task, including ones the agent has since compacted
+        away. Nothing else counts as given by the task.
+
+        Compaction replaces old messages with one *user* message holding their clipped
+        text. In a 2026-10-26 live run that summary carried Research's search results, so
+        the citation check took a search hit (neuralgist.com) for one of the task's own URLs
+        and the number check took its "4,096" for a number the task gave; the fetched pages
+        themselves were gone. The guard's own send-back message (which names the flagged
+        numbers and URLs) is not given by the task either, so a retry can't pass on it.
+
+        Each remembered message keeps its own slot: a tool result is identified by its
+        ``tool_call_id`` (an assistant call by its first call's id) when it has one, else by
+        object identity. Two distinct results must never merge, or ``missing_calls``, which
+        counts result *occurrences*, would under-count the required calls."""
+        for m in messages:
+            if m.role == "tool":
+                key: object = ("tool", m.tool_call_id) if m.tool_call_id else id(m)
+            elif m.role == "assistant" and m.tool_calls:
+                first = m.tool_calls[0].id
+                key = ("call", first) if first else id(m)
+            else:
+                continue
+            self.seen.setdefault(key, m)
+        system = [m for m in messages if m.role == "system"]
+        task = next(([m] for m in messages if m.role == "user"), [])
+        return [*system, *task, *self.seen.values()]
 
     def _problem(self, answer: str, messages: list[Message]) -> SendBack | None:
         if not answer.strip():
@@ -337,7 +368,7 @@ class AnswerGuardLLM:
                     "plainly that you could not find the value. Then rewrite the answer.",
                 )
         if self.check_citations:
-            bad = unfetched_citations(answer, messages, self.check_citations, self.fetched)
+            bad = unfetched_citations(answer, messages, self.check_citations)
             if bad:
                 return SendBack(
                     "citations",
@@ -373,16 +404,14 @@ class AnswerGuardLLM:
         ]
 
     def chat(self, messages: list[Message], tools: list[dict[str, Any]]) -> ChatResponse:
-        if self.check_citations:
-            # The agent compacts long histories, which can drop an early fetch's result, so
-            # fetches seen on any earlier call count too (one guard serves one task).
-            self.fetched |= fetched_urls(messages, self.check_citations)
-        resp = self.inner.chat([*messages, *self._reminder(messages)], tools)
+        history = self._history(messages)
+        resp = self.inner.chat([*messages, *self._reminder(history)], tools)
         extra: list[Message] = []
         p_tok = c_tok = 0  # tokens of the replies sent back
         while not resp.message.tool_calls and self.nudges < self.max_nudges:
-            # Tool results fetched during earlier nudges count too.
-            problem = self._problem(resp.message.content, [*messages, *extra])
+            # A reply with tool calls ends the loop, so no tool result arrives in here: the
+            # history is the same for every retry.
+            problem = self._problem(resp.message.content, history)
             if problem is None:
                 break
             self.nudges += 1

@@ -143,6 +143,26 @@ def test_guard_passes_answer_once_satisfied():
     history = [tool_msg("web__fetch_url"), tool_msg("web__fetch_url")]
     assert RequireToolsLLM(inner, {"fetch_url": 2}).chat(history, []).message is ANSWER
     assert len(inner.seen) == 1
+    assert inner.seen[0] == history  # nothing left to remind it of
+
+
+def test_guard_reminds_the_model_before_it_answers():
+    # The model hears what is still missing on the call itself, not only after an early
+    # answer has been sent back (which costs a second call).
+    inner = ScriptedLLM([FETCH, FETCH])
+    guard = RequireToolsLLM(inner, {"fetch_url": 2, "run_python": 1})
+    history = [Message(role="user", content="q"), tool_msg("web__fetch_url")]
+    assert guard.chat(history, []).message is FETCH
+    note = inner.seen[0][-1]
+    assert inner.seen[0][:-1] == history
+    assert note.role == "user"
+    assert "1 more successful fetch_url call(s)" in note.content
+    assert "1 more successful run_python call(s)" in note.content
+    # Not kept in the history: the caller's list is unchanged.
+    assert history[-1].role == "tool" and len(history) == 2
+    # A failed call doesn't count, so the note still asks for it.
+    guard.chat([*history, tool_msg("fetch_url", "ERROR: HTTP 404")], [])
+    assert "1 more successful fetch_url" in inner.seen[1][-1].content
 
 
 def test_guard_gives_up_after_max_nudges():

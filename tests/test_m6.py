@@ -225,6 +225,27 @@ def test_trace_stats_counts_the_url_after_a_redirect(tmp_path):
     assert trace_stats([a])["fetched"] == [asked, final, "https://b.example"]
 
 
+def test_trace_stats_counts_both_parts_of_a_hugging_face_fetch(tmp_path):
+    # One card fetch returns the card and the model's config.json under "from <url>"
+    # headings. Research's citation guard counts both; the eval scored a citation of the
+    # config.json as unfetched (r-qwen-license, 2026-10-26).
+    card = "https://huggingface.co/Qwen/Qwen3-8B"
+    config = "https://huggingface.co/Qwen/Qwen3-8B/blob/main/config.json"
+    text = f"[This model's config.json, from {config}]\n{{}}\n\n[The model card, from {card}]\nx"
+    a = _write(
+        tmp_path / "research" / "t-1.jsonl",
+        [
+            {
+                "event": "tool_result",
+                "ok": True,
+                "call": {"name": "web__fetch_url", "arguments": {"url": card}},
+                "output": json.dumps({"url": card, "title": None, "text": text}),
+            },
+        ],
+    )
+    assert trace_stats([a])["fetched"] == [card, config]
+
+
 def test_guard_reports_tokens_of_refused_replies():
     class Inner:
         model = "m"

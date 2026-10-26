@@ -298,6 +298,7 @@ def trace_stats(paths: list[Path]) -> dict[str, Any]:
         "tool_errors": 0,
         "tools": Counter(),
         "sent_back": Counter(),
+        "cut_off": 0,
         "fetched": [],
         "writes": [],
     }
@@ -311,6 +312,10 @@ def trace_stats(paths: list[Path]) -> dict[str, Any]:
             except json.JSONDecodeError:
                 continue
             kind = ev.get("event")
+            if kind in ("answer_sent_back", "llm_response") and ev.get("done_reason") == "length":
+                # The backend's reply limit (num_predict) stopped it. With thinking on, that
+                # can leave no content at all, which the empty check then sends back.
+                s["cut_off"] += 1
             if kind == "answer_sent_back":
                 # A reply an answer guard refused: a model call of its own (its tokens are
                 # already folded into the llm_response of the reply the agent kept).
@@ -444,6 +449,8 @@ class RunRecord(BaseModel):
     tools: dict[str, int] = Field(default_factory=dict)
     # answers an agent's guard sent back, by check (see runtime.AnswerGuardLLM)
     sent_back: dict[str, int] = Field(default_factory=dict)
+    # model replies the backend's reply limit cut off (done_reason "length"), sent back or kept
+    cut_off: int = 0
     # multi only: the plan, and the A2A tasks the orchestrator sent (attempts included)
     plan: list[str] = Field(default_factory=list)
     agent_tasks: int = 0
@@ -492,6 +499,7 @@ def finish_record(rec: RunRecord, task: EvalTask, trace_root: Path) -> RunRecord
     rec.prompt_tokens, rec.completion_tokens = st["prompt_tokens"], st["completion_tokens"]
     rec.tool_calls, rec.tool_errors, rec.tools = st["tool_calls"], st["tool_errors"], st["tools"]
     rec.sent_back = st["sent_back"]
+    rec.cut_off = st["cut_off"]
     rec.fetched = st["fetched"]
     rec.writes = st["writes"]
     if rec.cancelled_at:
@@ -868,6 +876,13 @@ def report(results: list[RunRecord], tasks: list[EvalTask] | None = None) -> str
         return f"{runs} runs ({detail})"
 
     row("Answers sent back by a check", sent_back)
+
+    def cut_off(rs: list[RunRecord]) -> str:
+        runs = sum(bool(r.cut_off) for r in rs)
+        return f"{runs} runs ({sum(r.cut_off for r in rs)} replies)" if runs else "none"
+
+    # Traces written before AgentOS recorded done_reason can't show this; they read "none".
+    row("Replies cut off at the reply limit", cut_off)
     row(
         "Failures",
         lambda rs: (

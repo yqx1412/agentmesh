@@ -45,4 +45,4 @@ addopts = "-ra"
 asyncio_mode = "auto"
 
 [tool.uv.sources]
-agentos = { git = "https://github.com/yqx1412/agentos", rev = "375e4b35ccd4d56a88b4cb78d9f0ca5c7053a7db" }
+agentos = { git = "https://github.com/yqx1412/agentos", rev = "d1c8a366629840ede1ff822c76380ce4cbad8d94" }

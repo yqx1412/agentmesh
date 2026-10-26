@@ -19,6 +19,7 @@ from agentmesh.runtime import (
     invented_quotes,
     missing_calls,
     select_tools,
+    strip_citations,
     system_prompt,
     unfetched_citations,
     unfetched_numbers,
@@ -394,6 +395,60 @@ def test_guard_retry_cannot_pass_on_its_own_send_back():
         guard = AnswerGuardLLM(inner, **{f"check_{kind}": "fetch_url"})
         assert guard.chat([task, *card], []).message is ANSWER
         assert guard.nudges == 2
+
+
+def test_strip_citations_removes_url_and_its_wrapper():
+    bad = ["https://docs.ollama.com/context-length"]
+    # The bracket that only held the citation goes with it.
+    assert strip_citations("Default is 4,096 [https://docs.ollama.com/context-length].", bad) == (
+        "Default is 4,096 ."
+    )
+    # A trailing slash / fragment still matches (normalized compare).
+    assert strip_citations("see [https://docs.ollama.com/context-length/#x]", bad) == "see"
+    # One of two citations: the separator left behind is tidied, the good one stays.
+    two = "4,096 [https://docs.ollama.com/context-length, https://ollama.com/blog]"
+    assert strip_citations(two, bad) == "4,096 [https://ollama.com/blog]"
+    # A good citation that merely shares a prefix is never in `bad`, so nothing is touched.
+    assert (
+        strip_citations("fine [https://ollama.com/blog]", bad) == "fine [https://ollama.com/blog]"
+    )
+
+
+def test_guard_strips_unfetched_citation_when_budget_is_spent():
+    # The 2026-10-26 nudge-exhaustion case: the guard caught the compacted neuralgist
+    # citation and spent its 3 nudges, then the final answer cited a page it only searched.
+    before, after = _compacted_ratio_history()
+    step = Message(role="assistant", tool_calls=[ToolCall(id="z", name="x", arguments={})])
+    neuralgist = Message(
+        role="assistant",
+        content="Ollama's default is 4,096 tokens [https://neuralgist.com/ollama-4k-context-window].",
+    )
+    # Every retry keeps citing an unfetched page, so the nudges run out.
+    ollama = Message(
+        role="assistant",
+        content="Ollama's default is 4,096 tokens [https://docs.ollama.com/context-length].",
+    )
+    inner = ScriptedLLM([step, neuralgist, ollama, ollama, ollama])
+    guard = AnswerGuardLLM(inner, check_citations="fetch_url", max_nudges=3)
+    guard.chat(before, [])  # a step that saw the fetch
+    resp = guard.chat(after, [])
+    assert guard.nudges == 3  # the budget was spent
+    # The unfetched citation is gone from the shipped answer, not left in it.
+    assert "docs.ollama.com" not in resp.message.content
+    assert "neuralgist.com" not in resp.message.content
+    assert "4,096 tokens" in resp.message.content
+
+
+def test_guard_keeps_a_fetched_citation_through_the_recheck():
+    # The recheck must not strip a citation the agent did fetch.
+    task = Message(role="user", content="Qwen3-8B's context?")
+    card = _fetch(CARD_URL, json.dumps({"url": CARD_URL, "text": "Context Length: 32,768"}), "a")
+    good = Message(role="assistant", content=f"Qwen3-8B: 32,768 tokens [{CARD_URL}].")
+    inner = ScriptedLLM([good])
+    guard = AnswerGuardLLM(inner, check_citations="fetch_url")
+    resp = guard.chat([task, *card], [])
+    assert guard.nudges == 0
+    assert resp.message.content == f"Qwen3-8B: 32,768 tokens [{CARD_URL}]."
 
 
 def test_unfetched_numbers_reads_the_pages_each_claim_cites():

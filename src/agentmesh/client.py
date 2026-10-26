@@ -193,6 +193,19 @@ async def ask_push(
     return run
 
 
+async def task_state(card: AgentCard, task_id: str, http: httpx.AsyncClient) -> str:
+    """The state the agent reports for a task now, or ``error: ...`` when asking failed.
+    Never raises (the eval uses it to check that a cancelled task really stopped)."""
+    try:
+        client = await create_client(
+            agent=card, client_config=ClientConfig(streaming=False, httpx_client=http)
+        )
+        task = await client.get_task(GetTaskRequest(id=task_id))
+        return state_name(task.status.state)
+    except Exception as exc:
+        return f"error: {type(exc).__name__}: {exc}"[:200]
+
+
 async def cancel(card: AgentCard, task_id: str, http: httpx.AsyncClient) -> str:
     """Ask the agent to cancel a task. Returns the state it reports, or why that failed.
     Never raises: cancelling is cleanup, and the agent may already be gone."""

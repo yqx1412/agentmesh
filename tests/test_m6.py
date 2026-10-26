@@ -6,10 +6,12 @@ import json
 import re
 from pathlib import Path
 
+import httpx
 import pytest
 from agentos.agent import Tracer
 from agentos.llm import ChatResponse, Message, ToolCall
 from test_m3 import Fleet, ScriptedChat, plan, step
+from test_m4 import Proc
 
 from agentmesh.evaluate import (
     EvalTask,
@@ -496,3 +498,253 @@ async def test_run_eval_streams_resumes_and_reports(tmp_path):
     assert "| Answers sent back by a check | none | 1 runs (citations 2, numbers 1) |" in (
         report(results, tasks)
     )
+
+
+# --- side effects: writes and cancels ------------------------------------------------------
+
+SIDE = ROOT / "benchmarks" / "m6" / "tasks-side-effects.yaml"
+
+
+def test_side_effect_tasks_load_and_stay_out_of_the_m6_set():
+    tasks = {t.id: t for t in load_tasks(SIDE)}
+    assert set(tasks) == {
+        "w-verified-write",
+        "w-unverified-detail",
+        "x-cancel-dispatch",
+        "x-cancel-midrun",
+    }
+    assert tasks["w-verified-write"].allow_writes and tasks["w-verified-write"].systems == ["multi"]
+    assert tasks["x-cancel-dispatch"].cancel.at == "dispatch"
+    assert tasks["x-cancel-midrun"].cancel.after == 30
+    assert not ({t.id for t in load_tasks(TASKS)} & set(tasks))
+    # The write task never goes to the single agent; the mid-run cancel goes to both.
+    order = [(t.id, s) for t, s, _ in schedule(list(tasks.values()), ["single", "multi"], 1)]
+    assert ("w-verified-write", "single") not in order
+    assert {s for t, s in order if t == "x-cancel-midrun"} == {"single", "multi"}
+
+
+@pytest.mark.parametrize(
+    "cancel",
+    [{}, {"at": "dispatch", "after": 3}],
+)
+def test_cancel_needs_exactly_one_moment(cancel):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        EvalTask.model_validate(
+            {
+                "id": "x",
+                "category": "cancel",
+                "systems": ["multi"],
+                "cancel": cancel,
+                "prompt": "p",
+                "checks": [{"type": "remote_stopped"}],
+            }
+        )
+
+
+def test_cancel_at_dispatch_is_multi_only():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="systems"):
+        EvalTask.model_validate(
+            {
+                "id": "x",
+                "category": "cancel",
+                "cancel": {"at": "dispatch"},
+                "prompt": "p",
+                "checks": [{"type": "remote_stopped"}],
+            }
+        )
+
+
+def _add_fact(statement: str, ok: bool, output: str) -> dict:
+    return {
+        "event": "tool_result",
+        "ok": ok,
+        "call": {
+            "name": "domaingraph__add_fact",
+            "arguments": {"statement": statement, "details": {"source": "https://x.example"}},
+        },
+        "output": output,
+    }
+
+
+def test_trace_stats_reads_new_duplicate_and_refused_writes(tmp_path):
+    p = _write(
+        tmp_path / "knowledge" / "t-1.jsonl",
+        [
+            _add_fact("Ollama binds port 11434", True, '{"id": 7, "new": true}'),
+            _add_fact(
+                "Ollama binds port 11434",
+                True,
+                "ALREADY STORED: this fact was already in the knowledge base (id 7); "
+                'nothing new was added.\n{"id": 7, "new": false}',
+            ),
+            _add_fact("Context is 32,768", False, "refused: the Verifier did not check this"),
+        ],
+    )
+    writes = trace_stats([p])["writes"]
+    assert [(w["ok"], w["id"], w["new"]) for w in writes] == [
+        (True, 7, True),
+        (True, 7, False),
+        (False, None, None),
+    ]
+    assert writes[2]["error"].startswith("refused")
+
+
+def test_stored_check_reads_writes_not_the_answer():
+    task = next(t for t in load_tasks(SIDE) if t.id == "w-verified-write")
+    rec = RunRecord(system="multi", task_id=task.id, category="write", repeat=0, passed=False)
+    claim = "Ollama binds 127.0.0.1 port 11434 by default"
+    # The answer claims both were stored; the trace says only claim 1 went through.
+    answer = "Both claims were stored."
+    rec.writes = [
+        {"statement": claim, "ok": True, "id": 7, "new": False},
+        {"statement": "default context window is 32,768 tokens", "ok": False, "id": None},
+    ]
+    assert all(c["ok"] for c in score(task, answer, rec))
+    rec.writes[1]["ok"] = True  # the PR #21 bug: the unsupported claim is stored
+    assert [c["ok"] for c in score(task, answer, rec)] == [True, False]
+    rec.writes = []  # nothing stored at all
+    assert [c["ok"] for c in score(task, answer, rec)] == [False, True]
+
+
+def _cancel_task(cancel: dict, systems=None) -> EvalTask:
+    return EvalTask.model_validate(
+        {
+            "id": "x-c",
+            "category": "cancel",
+            "systems": systems,
+            "cancel": {**cancel, "grace": 0.3},
+            "prompt": "Which port does Ollama use?",
+            "checks": [{"type": "remote_stopped", "min_tasks": 1}],
+        }
+    )
+
+
+# The cancel tests need agents in their own processes: the in-process ASGI transport
+# hands a streamed reply over only when it is complete, so no task id would arrive
+# before the cancel. tests/agent_proc.py runs 20 s per task and stops when cancelled.
+
+
+@pytest.fixture
+def procs(tmp_path):
+    started: list[Proc] = []
+
+    def start(name: str, skill: str, seconds: float) -> Proc:
+        p = Proc(tmp_path, name, skill, seconds)
+        started.append(p)
+        return p
+
+    yield start
+    for p in started:
+        if p.p.poll() is None:
+            p.kill()
+
+
+async def _multi_cancel(tmp_path, procs, cancel: dict) -> tuple[RunRecord, object]:
+    agent = procs("Research", "web_research", 20)
+    agent.wait_up()
+    task = _cancel_task(cancel, ["multi"])
+    root = tmp_path / "traces"
+    async with httpx.AsyncClient(timeout=30) as http:
+        cards, _ = await discover_all([agent.url], http)
+        rec = await run_multi(
+            task,
+            cards,
+            ScriptedChat(plan(step("s1", "web_research", "Find Ollama's port"))),
+            http,
+            trace_root=root,
+            policy=RunPolicy(step_timeout=30),
+            timeout=30,
+            model_name="m",
+        )
+    return finish_record(rec, task, root), agent
+
+
+async def test_cancel_at_dispatch_stops_the_remote_task(tmp_path, procs):
+    rec, agent = await _multi_cancel(tmp_path, procs, {"at": "dispatch"})
+    assert rec.state == "canceled" and rec.cancelled_at
+    assert [t["state"] for t in rec.remote] == ["canceled"]
+    assert "canceled" in agent.states() and "completed" not in agent.states()
+    assert rec.passed, rec.checks
+
+
+async def test_cancel_at_dispatch_fails_when_the_cancel_misses_the_task(
+    tmp_path, procs, monkeypatch
+):
+    # PR #19's bug, put back: the step stops waiting for the task id at once, so the
+    # remote task is never cancelled. The check must catch it.
+    import agentmesh.orchestrator as orch
+
+    monkeypatch.setattr(orch, "ID_WAIT", 0.0)
+    rec, _ = await _multi_cancel(tmp_path, procs, {"at": "dispatch"})
+    assert not rec.passed
+    assert "remote_stopped" in {c["type"] for c in rec.checks if not c["ok"]}
+
+
+async def test_cancel_after_seconds_stops_a_multi_run(tmp_path, procs):
+    rec, agent = await _multi_cancel(tmp_path, procs, {"after": 1.0})
+    assert [t["state"] for t in rec.remote] == ["canceled"]
+    assert "canceled" in agent.states()
+    assert rec.passed, rec.checks
+
+
+async def test_cancel_after_seconds_stops_the_single_agent(tmp_path, procs):
+    agent = procs("Solo", "general", 20)
+    agent.wait_up()
+    task = _cancel_task({"after": 1.0})
+    async with httpx.AsyncClient(timeout=30) as http:
+        cards, _ = await discover_all([agent.url], http)
+        rec = await run_single(task, cards[0], http, skill="general", timeout=30)
+    finish_record(rec, task, tmp_path / "traces")
+    assert rec.cancelled_at and [t["state"] for t in rec.remote] == ["canceled"]
+    assert "canceled" in agent.states()
+    assert rec.passed, rec.checks
+
+
+def test_calls_after_counts_model_calls_past_the_cancel(tmp_path):
+    from agentmesh.evaluate import calls_after
+
+    a = _write(
+        tmp_path / "a.jsonl",
+        [{"ts": 1.0, "event": "llm_response"}, {"ts": 5.0, "event": "llm_response"}],
+    )
+    b = _write(
+        tmp_path / "b.jsonl",
+        [{"ts": t, "event": "llm_response"} for t in (6.0, 7.0)]
+        + [{"ts": 8.0, "event": "answer_sent_back"}, {"ts": 9.0, "event": "tool_result"}],
+    )
+    assert calls_after([a, b], 4.0) == 3
+    assert calls_after([a], 9.0) == 0
+
+
+def test_remote_stopped_fails_when_a_task_kept_working():
+    task = _cancel_task({"after": 1})
+    rec = RunRecord(system="multi", task_id="x-c", category="cancel", repeat=0, passed=False)
+    assert not score(task, "", rec)[0]["ok"]  # never cancelled: nothing was tested
+    rec.cancelled_at = 1.0
+    rec.remote = [{"agent": "R", "task_id": "t", "state": "working"}]
+    assert "not canceled" in score(task, "", rec)[0]["detail"]
+    rec.remote[0]["state"] = "canceled"
+    rec.calls_after_cancel = 3
+    assert "model calls after" in score(task, "", rec)[0]["detail"]
+    rec.calls_after_cancel = 1
+    # A step that had already finished before the cancel may be completed.
+    rec.remote.append(
+        {"agent": "V", "task_id": "u", "state": "completed", "finished_before_cancel": True}
+    )
+    assert score(task, "", rec)[0]["ok"]
+
+
+def test_report_shows_a_dash_for_a_system_that_skipped_a_task():
+    rs = [
+        RunRecord(system="single", task_id="a", category="c", repeat=0, passed=True),
+        RunRecord(system="multi", task_id="a", category="c", repeat=0, passed=True),
+        RunRecord(system="multi", task_id="w", category="write", repeat=0, passed=True),
+    ]
+    text = report(rs)
+    assert re.search(r"\| w \| - \| - \| 1/1 \|", text)
+    assert re.search(r"\| write \| - \| - \| - \| 1/1 \(100%\) \|", text)
+    assert "multi passed more often on 0, less often on 0 and equally on 1" in text

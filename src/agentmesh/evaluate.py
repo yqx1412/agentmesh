@@ -29,6 +29,7 @@ import subprocess
 import time
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -44,9 +45,10 @@ from agentos.bench.checks import (
     _Check,
     _clip,
 )
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from agentmesh.client import TaskRun, ask, cancel
+from agentmesh.access import read_write_result
+from agentmesh.client import TaskRun, ask, cancel, task_state
 from agentmesh.orchestrator import Chat, Orchestration, RunPolicy, orchestrate
 from agentmesh.urls import normalize_url, urls_in
 
@@ -104,8 +106,83 @@ class AnswerTimestamp(_Check):
         )
 
 
+@dataclass
+class RunView(Outcome):
+    """An ``Outcome`` that also carries the run record, for checks that look at what the
+    run did (its writes, its remote tasks) rather than at the answer."""
+
+    run: Any = None
+
+
+class Stored(_Check):
+    """A knowledge write whose statement matches ``pattern`` went through (stored as new,
+    or found already stored) -- or, with ``expect: false``, none did. Read from the writing
+    agent's trace (its add_fact results), not from what the answer says about it."""
+
+    type: Literal["stored"]
+    pattern: str
+    expect: bool = True
+
+    def evaluate(self, o: Outcome) -> CheckResult:
+        writes = getattr(getattr(o, "run", None), "writes", None) or []
+        hit = [w for w in writes if re.search(self.pattern, w["statement"], re.I)]
+        through = [w for w in hit if w["ok"]]
+        refused = len(hit) - len(through)
+        if self.expect:
+            if through:
+                w = through[0]
+                how = "stored as new" if w.get("new") else "already stored"
+                return CheckResult(True, f"/{self.pattern}/ {how} (id {w.get('id')})")
+            return CheckResult(
+                False,
+                f"no write of /{self.pattern}/ went through ({refused} refused, "
+                f"{len(writes)} write(s) in all)",
+            )
+        if through:
+            stored = _clip(through[0]["statement"])
+            return CheckResult(False, f"/{self.pattern}/ was stored: {stored!r}")
+        return CheckResult(True, f"/{self.pattern}/ not stored ({refused} attempt(s) refused)")
+
+
+class RemoteStopped(_Check):
+    """The eval cancelled the run, and every A2A task the run had started and that was
+    still going is ``canceled`` when asked afterwards; no agent made more than
+    ``max_calls_after`` model calls after the cancel (an agent stops at its next model
+    call, so the one in flight may still finish)."""
+
+    type: Literal["remote_stopped"]
+    min_tasks: int = Field(default=1, ge=0)
+    max_calls_after: int = Field(default=1, ge=0)
+
+    def evaluate(self, o: Outcome) -> CheckResult:
+        run = getattr(o, "run", None)
+        if run is None or not run.cancelled_at:
+            return CheckResult(False, "the run ended before the eval could cancel it")
+        tasks = run.remote
+        if len(tasks) < self.min_tasks:
+            return CheckResult(
+                False, f"{len(tasks)} remote task(s) seen, want {self.min_tasks}; {run.message}"
+            )
+        going = [t for t in tasks if not t.get("finished_before_cancel")]
+        bad = [t for t in going if t.get("state") != "canceled"]
+        if bad:
+            listed = ", ".join(f"{t['agent']} {t['state']}" for t in bad)
+            return CheckResult(False, f"not canceled after the cancel: {listed}")
+        if run.calls_after_cancel > self.max_calls_after:
+            return CheckResult(
+                False,
+                f"an agent made {run.calls_after_cancel} model calls after the cancel "
+                f"(max {self.max_calls_after})",
+            )
+        return CheckResult(
+            True,
+            f"{len(going)} remote task(s) canceled, {len(tasks) - len(going)} had finished; "
+            f"at most {run.calls_after_cancel} model call(s) after the cancel",
+        )
+
+
 Check = Annotated[
-    AnswerContains | AnswerNumber | AnswerRegex | AnswerTimestamp,
+    AnswerContains | AnswerNumber | AnswerRegex | AnswerTimestamp | Stored | RemoteStopped,
     Field(discriminator="type"),
 ]
 
@@ -114,6 +191,25 @@ Check = Annotated[
 
 class EvalError(Exception):
     """The task file or the setup is unusable."""
+
+
+class CancelAt(BaseModel):
+    """When the eval cancels a run: ``after`` seconds, or ``at: dispatch``, the moment the
+    orchestrator sends its first step and before the agent has replied with a task id (the
+    window PR #19 closed; multi only). (Not ``on``: YAML reads a bare ``on`` key as true.)"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    at: Literal["dispatch"] | None = None
+    after: float | None = Field(default=None, gt=0)
+    # How long to wait after the cancel before asking the agents for the tasks' states.
+    grace: float = Field(default=10.0, ge=0)
+
+    @model_validator(mode="after")
+    def _one(self) -> CancelAt:
+        if (self.at is None) == (self.after is None):
+            raise ValueError('cancel needs exactly one of "at" and "after"')
+        return self
 
 
 class EvalTask(BaseModel):
@@ -125,7 +221,21 @@ class EvalTask(BaseModel):
     checks: list[Check] = Field(min_length=1)
     # The answer must cite web pages; cited URLs are compared with the fetched ones.
     cites: bool = False
+    # Offer the planner the skills tagged ``write`` (orchestrate --allow-writes).
+    allow_writes: bool = False
+    # Run on these systems only (the single agent has no add_fact, so no write task).
+    systems: list[Literal["single", "multi"]] | None = None
+    cancel: CancelAt | None = None
     notes: str | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> EvalTask:
+        if self.cancel and self.cancel.at == "dispatch" and self.systems != ["multi"]:
+            raise ValueError(f'{self.id}: cancel at "dispatch" needs systems: [multi]')
+        return self
+
+    def runs_on(self, system: str) -> bool:
+        return self.systems is None or system in self.systems
 
 
 def load_tasks(path: Path) -> list[EvalTask]:
@@ -158,8 +268,8 @@ def select_tasks(tasks: list[EvalTask], patterns: list[str] | None) -> list[Eval
     ]
 
 
-def score(task: EvalTask, answer: str) -> list[dict[str, Any]]:
-    outcome = Outcome(Path("."), answer)
+def score(task: EvalTask, answer: str, run: Any = None) -> list[dict[str, Any]]:
+    outcome = RunView(Path("."), answer, run=run)
     out = []
     for c in task.checks:
         r = c.evaluate(outcome)
@@ -189,6 +299,7 @@ def trace_stats(paths: list[Path]) -> dict[str, Any]:
         "tools": Counter(),
         "sent_back": Counter(),
         "fetched": [],
+        "writes": [],
     }
     for p in paths:
         # The orchestrator's trace records its delegations as tool results; they are A2A
@@ -214,6 +325,8 @@ def trace_stats(paths: list[Path]) -> dict[str, Any]:
                 name = str(call.get("name", "?")).split("__")[-1]
                 s["tool_calls"] += 1
                 s["tools"][name] += 1
+                if name == "add_fact":
+                    s["writes"].append(_write_entry(call, ev))
                 if not ev.get("ok"):
                     s["tool_errors"] += 1
                 elif name == "fetch_url":
@@ -230,6 +343,51 @@ def trace_stats(paths: list[Path]) -> dict[str, Any]:
     s["sent_back"] = dict(s["sent_back"])
     s["fetched"] = list(dict.fromkeys(s["fetched"]))
     return s
+
+
+_ALREADY = re.compile(r"^ALREADY STORED\b.*?\(id (\d+)\)")
+
+
+def _write_entry(call: dict[str, Any], ev: dict[str, Any]) -> dict[str, Any]:
+    """One add_fact call as the trace saw it: the statement, whether it went through, and
+    the id / ``new`` flag the tool returned (a refusal by the write grant is ``ok: false``
+    with the reason as output)."""
+    args = call.get("arguments") or {}
+    output = ev.get("output")
+    entry: dict[str, Any] = {
+        "statement": read_write_result(args, None).statement,
+        "ok": bool(ev.get("ok")),
+        "id": None,
+        "new": None,
+    }
+    if not entry["ok"]:
+        entry["error"] = str(output)[:300]
+    elif isinstance(output, str) and (m := _ALREADY.match(output)):
+        # The grant's duplicate note comes before the tool's JSON (runtime._attested).
+        entry["id"], entry["new"] = int(m.group(1)), False
+    else:
+        rec = read_write_result(args, output)
+        entry["id"], entry["new"] = rec.id, rec.new
+    return entry
+
+
+def calls_after(paths: list[Path], t: float) -> int:
+    """The most model calls any one trace logged after time ``t`` (epoch seconds)."""
+    most = 0
+    for p in paths:
+        n = 0
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                ev.get("event") in ("llm_response", "answer_sent_back")
+                and float(ev.get("ts") or 0) > t
+            ):
+                n += 1
+        most = max(most, n)
+    return most
 
 
 def _result_url(output: Any) -> str | None:
@@ -277,6 +435,14 @@ class RunRecord(BaseModel):
     task_ids: list[str] = Field(default_factory=list)
     traces: list[str] = Field(default_factory=list)
     started: str = ""
+    # add_fact calls in the agents' traces (see ``_write_entry``)
+    writes: list[dict[str, Any]] = Field(default_factory=list)
+    # cancel tasks: when the eval cancelled the run (epoch s, 0 = it didn't), each remote
+    # task it had started with its state afterwards, and the most model calls any of their
+    # traces logged after the cancel
+    cancelled_at: float = 0.0
+    remote: list[dict[str, Any]] = Field(default_factory=list)
+    calls_after_cancel: int = 0
 
     @property
     def tokens(self) -> int:
@@ -299,10 +465,7 @@ def classify(checks: list[dict[str, Any]], answer: str, state: str) -> str:
 
 
 def finish_record(rec: RunRecord, task: EvalTask, trace_root: Path) -> RunRecord:
-    """Score the answer and fill in cost and citations from the traces."""
-    rec.checks = score(task, rec.answer)
-    rec.passed = bool(rec.answer.strip()) and all(c["ok"] for c in rec.checks)
-    rec.failure = "" if rec.passed else classify(rec.checks, rec.answer, rec.state) or "wrong"
+    """Fill in cost, writes and citations from the traces, then score the run."""
     paths = find_traces(trace_root, rec.task_ids)
     st = trace_stats(paths)
     rec.traces = [str(p) for p in paths]
@@ -311,9 +474,21 @@ def finish_record(rec: RunRecord, task: EvalTask, trace_root: Path) -> RunRecord
     rec.tool_calls, rec.tool_errors, rec.tools = st["tool_calls"], st["tool_errors"], st["tools"]
     rec.sent_back = st["sent_back"]
     rec.fetched = st["fetched"]
+    rec.writes = st["writes"]
+    if rec.cancelled_at:
+        remote = find_traces(trace_root, [t["task_id"] for t in rec.remote])
+        rec.calls_after_cancel = calls_after(remote, rec.cancelled_at)
     if task.cites:
         rec.cited = urls_in(rec.answer)
         rec.unfetched_citations = [u for u in rec.cited if u not in set(rec.fetched)]
+    rec.checks = score(task, rec.answer, rec)
+    if task.cancel is not None:
+        # A cancelled run has no answer to show; only its checks count.
+        rec.passed = all(c["ok"] for c in rec.checks)
+        rec.failure = "" if rec.passed else classify(rec.checks, "(cancelled)", "")
+        return rec
+    rec.passed = bool(rec.answer.strip()) and all(c["ok"] for c in rec.checks)
+    rec.failure = "" if rec.passed else classify(rec.checks, rec.answer, rec.state) or "wrong"
     return rec
 
 
@@ -336,27 +511,74 @@ async def run_single(
 
     t0 = time.perf_counter()
     run: TaskRun | None = None
+    job = asyncio.ensure_future(
+        ask(card, task.prompt, http, on_event=on_event, metadata={"skill": skill})
+    )
     try:
-        run = await asyncio.wait_for(
-            ask(card, task.prompt, http, on_event=on_event, metadata={"skill": skill}), timeout
-        )
+        if task.cancel is not None and task.cancel.after is not None:
+            await asyncio.wait({job}, timeout=task.cancel.after)
+            if not job.done():
+                rec.cancelled_at = time.time()
+                if seen:
+                    said = await _cancel_within(card, seen[0], http)
+                    rec.message = f"cancelled after {task.cancel.after:g} s: {said}"
+                else:
+                    rec.message = f"no task id after {task.cancel.after:g} s, nothing to cancel"
+                    job.cancel()
+        run = await asyncio.wait_for(job, max(1.0, timeout - (time.perf_counter() - t0)))
     except TimeoutError:
         rec.state, rec.message = "timeout", f"no answer after {timeout:g} s"
         if seen:
-            try:
-                rec.message += (
-                    f"; remote task {await asyncio.wait_for(cancel(card, seen[0], http), 10)}"
-                )
-            except Exception as exc:  # the record matters more than the cancel
-                rec.message += f"; cancel failed: {type(exc).__name__}"
+            rec.message += f"; remote task {await _cancel_within(card, seen[0], http)}"
+    except asyncio.CancelledError:
+        if not rec.cancelled_at:
+            raise
+        rec.state = "canceled"
     except Exception as exc:
         rec.state, rec.message = "error", f"{type(exc).__name__}: {exc}"[:500]
     rec.seconds = round(time.perf_counter() - t0, 1)
     if run is not None:
+        note = rec.message
         rec.state, rec.message, rec.answer = run.state, run.final_message, run.answer
+        if rec.cancelled_at:
+            rec.message = f"{note}; {run.final_message}".strip("; ")
         seen = [run.task_id or (seen[0] if seen else "")]
     rec.task_ids = [t for t in seen if t]
+    if rec.cancelled_at and rec.task_ids:
+        await asyncio.sleep(task.cancel.grace if task.cancel else 0)
+        tid = rec.task_ids[0]
+        rec.remote = [
+            {"agent": card.name, "task_id": tid, "state": await task_state(card, tid, http)}
+        ]
     return rec
+
+
+async def _cancel_within(card: AgentCard, task_id: str, http: httpx.AsyncClient) -> str:
+    try:
+        return await asyncio.wait_for(cancel(card, task_id, http), 10)
+    except TimeoutError:
+        return "cancel failed: no reply in 10 s"
+
+
+# The orchestrator's journal lines (Recorder.state -> on_line) that a cancel task reads.
+_SENDING = re.compile(r"^\[working\] (\S+): sending ")
+_TOOK = re.compile(r"^\[working\] (\S+): (.+) took it as task (\S+)$")
+_ENDED = re.compile(
+    r"^\[working\] (\S+): .+ (?:completed|failed|timeout|unreachable|rejected|canceled) after "
+)
+
+
+async def _state_by_name(
+    cards: list[AgentCard], agent: str, task_id: str, http: httpx.AsyncClient
+) -> str:
+    """Ask the agent named ``agent`` for the task's state (two cards can share a name, so
+    try each until one knows the task)."""
+    said = f"error: no card named {agent!r}"
+    for card in (c for c in cards if c.name == agent):
+        said = await task_state(card, task_id, http)
+        if not said.startswith("error:"):
+            break
+    return said
 
 
 async def run_multi(
@@ -371,29 +593,84 @@ async def run_multi(
     model_name: str,
 ) -> RunRecord:
     """``task_ids`` holds the orchestration's run id (its own trace: plan and combine
-    tokens) and every A2A task it sent, retries and fallbacks included."""
+    tokens) and every A2A task it sent, retries and fallbacks included. For a cancel task,
+    the remote tasks come from the orchestrator's journal lines, since a cancelled
+    orchestration returns nothing."""
     rec = RunRecord(system="multi", task_id=task.id, category=task.category, repeat=0, passed=False)
+    when = task.cancel
+    remote: dict[str, dict[str, Any]] = {}
+    journal: list[str] = []
+    orch: asyncio.Future | None = None
+
+    def on_line(line: str) -> None:
+        journal.append(line)
+        if m := _TOOK.match(line):
+            sid, agent, tid = m.groups()
+            remote[tid] = {"agent": agent, "task_id": tid, "step": sid}
+        elif (m := _ENDED.match(line)) and not rec.cancelled_at:
+            for t in remote.values():
+                if t["step"] == m.group(1):
+                    t["finished_before_cancel"] = True
+        if (
+            when is not None
+            and when.at == "dispatch"
+            and not rec.cancelled_at
+            and _SENDING.match(line)
+            and orch is not None
+        ):
+            # Called inside the orchestration: it stops at its next await, which is the
+            # wait for the A2A call it has just started, before any task id has come back.
+            rec.cancelled_at = time.time()
+            orch.cancel()
+
     t0 = time.perf_counter()
     out: Orchestration | None = None
-    try:
-        out = await asyncio.wait_for(
-            orchestrate(
-                task.prompt,
-                cards,
-                chat,
-                http,
-                trace_root=trace_root,
-                policy=policy,
-                model_name=model_name,
-            ),
-            timeout,
+    orch = asyncio.ensure_future(
+        orchestrate(
+            task.prompt,
+            cards,
+            chat,
+            http,
+            trace_root=trace_root,
+            policy=policy,
+            model_name=model_name,
+            on_line=on_line,
+            allow_writes=task.allow_writes,
         )
-    except TimeoutError:
+    )
+    try:
+        if when is not None and when.after is not None:
+            await asyncio.wait({orch}, timeout=when.after)
+            if not orch.done():
+                rec.cancelled_at = time.time()
+                orch.cancel()
+        await asyncio.wait({orch}, timeout=max(1.0, timeout - (time.perf_counter() - t0)))
+    except asyncio.CancelledError:  # the eval itself was stopped: stop the run too
+        orch.cancel()
+        await asyncio.shield(asyncio.wait({orch}))
+        raise
+    if not orch.done():
         # orchestrate() cancels every remote task before re-raising.
+        orch.cancel()
+        await asyncio.wait({orch})
         rec.state, rec.message = "timeout", f"no answer after {timeout:g} s"
-    except Exception as exc:
+    elif orch.cancelled():
+        rec.state = "canceled"
+        said = [ln.removeprefix("[working] ") for ln in journal if "cancel" in ln.lower()]
+        rec.message = "; ".join(said)[:500] or "cancelled"
+    elif (exc := orch.exception()) is not None:
         rec.state, rec.message = "error", f"{type(exc).__name__}: {exc}"[:500]
+    else:
+        out = orch.result()
     rec.seconds = round(time.perf_counter() - t0, 1)
+    if rec.cancelled_at:
+        rec.task_ids = [*remote]
+        if remote:
+            await asyncio.sleep(when.grace if when else 0)
+        for t in remote.values():
+            t.setdefault("finished_before_cancel", False)
+            t["state"] = await _state_by_name(cards, t["agent"], t["task_id"], http)
+        rec.remote = list(remote.values())
     if out is None:
         return rec
     rec.answer, rec.message = out.answer, out.message
@@ -449,7 +726,7 @@ def schedule(
     for r in range(repeats):
         for i, t in enumerate(tasks):
             pair = systems if (i + r) % 2 == 0 else list(reversed(systems))
-            order += [(t, s, r) for s in pair]
+            order += [(t, s, r) for s in pair if t.runs_on(s)]
     return order
 
 
@@ -593,6 +870,9 @@ def report(results: list[RunRecord], tasks: list[EvalTask] | None = None) -> str
         cells = []
         for s in systems:
             rs = [r for r in by[s] if r.category == c]
+            if not rs:
+                cells += ["-", "-", "-"]
+                continue
             cells += [
                 _pct(sum(r.passed for r in rs), len(rs)),
                 f"{_median([r.seconds for r in rs]):.0f}",
@@ -609,6 +889,9 @@ def report(results: list[RunRecord], tasks: list[EvalTask] | None = None) -> str
         cells = []
         for s in systems:
             rs = [r for r in by[s] if r.task_id == tid]
+            if not rs:
+                cells += ["-", "-"]
+                continue
             cells += [
                 f"{sum(r.passed for r in rs)}/{len(rs)}",
                 f"{_median([r.seconds for r in rs]):.0f}",
@@ -622,6 +905,8 @@ def report(results: list[RunRecord], tasks: list[EvalTask] | None = None) -> str
     if "single" in by and "multi" in by:
         better = worse = same = 0
         for tid in order:
+            if not all(any(r.task_id == tid for r in by[s]) for s in ("single", "multi")):
+                continue
             a = sum(r.passed for r in by["single"] if r.task_id == tid)
             b = sum(r.passed for r in by["multi"] if r.task_id == tid)
             better += b > a

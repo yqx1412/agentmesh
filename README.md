@@ -568,6 +568,23 @@ composite tasks once each on both systems: 5 send-backs in 4 of the fleet's 9 ru
 answering without `run_python` twice), none from the citation or number checks; the
 single agent's guard sent nothing back.
 
+Those required-call send-backs cost a whole extra model call each, so the guard now also
+tells the model what is still missing before it answers: while a required call is
+missing, each model call gets a one-line note after the history, "(Status: before your
+final answer you need at least 1 more successful fetch_url call(s).)". The note isn't kept
+in the history and sits at the end, so the prompt prefix stays the same between steps.
+Fleet only, research, verification and composite tasks 3 times each (27 runs): before,
+13 runs had a send-back (14, all `required_calls`); with the note, 1 run did (an empty
+reply), and none was `required_calls`. Model calls fell from 188 to 174; tokens were about
+the same (525k against 534k), and 26 of 27 runs passed (27 before; the failure was
+`r-mcp-definition`, where that run's search and Wikipedia fetch returned no "USB-C"). Two
+other wordings were worse: "Until then, reply with a tool call" made the Verifier fetch its
+three pages one per step, and "several can go in one reply" made Research batch vague
+searches, fetch an unofficial MCP page and fail `r-mcp-definition` 3/3. The eval also now
+counts the config.json that comes back with a Hugging Face card fetch as fetched, as
+Research's citation guard already did; one run citing it was scored as unfetched. Re-scored
+from their traces, the published M6 results are unchanged.
+
 **Side-effect tasks** (`benchmarks/m6/tasks-side-effects.yaml`, outside the 16 M6 tasks so
 those numbers stay comparable) test what a run does, not only what it answers. Run them
 with `agentmesh eval run --tasks benchmarks/m6/tasks-side-effects.yaml`.

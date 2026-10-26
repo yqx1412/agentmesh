@@ -50,7 +50,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from agentmesh.access import read_write_result
 from agentmesh.client import TaskRun, ask, cancel, task_state
 from agentmesh.orchestrator import Chat, Orchestration, RunPolicy, orchestrate
-from agentmesh.urls import normalize_url, urls_in
+from agentmesh.urls import PART_FROM, normalize_url, urls_in
 
 SYSTEMS = ("single", "multi")
 
@@ -339,6 +339,10 @@ def trace_stats(paths: list[Path]) -> dict[str, Any]:
                     final = _result_url(ev.get("output"))
                     if final:
                         s["fetched"].append(normalize_url(final))
+                    # A Hugging Face card fetch also returns the model's config.json (and the
+                    # other way round), each part under a "[..., from <url>]" heading. The
+                    # citation guard counts both parts as fetched; so does the score.
+                    s["fetched"] += _result_parts(ev.get("output"))
     s["tools"] = dict(s["tools"])
     s["sent_back"] = dict(s["sent_back"])
     s["fetched"] = list(dict.fromkeys(s["fetched"]))
@@ -400,6 +404,21 @@ def _result_url(output: Any) -> str | None:
         return None
     url = data.get("url") if isinstance(data, dict) else None
     return url if isinstance(url, str) and url else None
+
+
+def _result_parts(output: Any) -> list[str]:
+    """Normalized URLs of the parts a ``fetch_url`` result's text names with a
+    ``[..., from <url>]`` heading (``webtools.with_model_config``)."""
+    if not isinstance(output, str):
+        return []
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError:
+        return []
+    text = data.get("text") if isinstance(data, dict) else None
+    if not isinstance(text, str):
+        return []
+    return [normalize_url(u) for u in PART_FROM.findall(text)]
 
 
 # --- one run ---------------------------------------------------------------------------

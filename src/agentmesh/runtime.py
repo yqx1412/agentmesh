@@ -27,7 +27,7 @@ from agentmesh.access import GRANT, Grant, read_write_result
 from agentmesh.executor import TASK_ID, Cancelled, Progress, Runner, RunOutcome
 from agentmesh.numbers import TRIVIAL, numbers
 from agentmesh.spec import SANDBOX_TOOLS, AgentSpec
-from agentmesh.urls import normalize_url, urls_in
+from agentmesh.urls import PART_FROM, normalize_url, urls_in
 
 
 class ProgressTracer(Tracer):
@@ -205,7 +205,7 @@ def _fetch_results(messages: list[Message], fetch_tool: str) -> list[tuple[set[s
             # each under a "[..., from <url>]" heading (webtools.with_model_config).
             text = data.get("text")
             if isinstance(text, str):
-                urls |= {normalize_url(u) for u in _PART_FROM.findall(text)}
+                urls |= {normalize_url(u) for u in PART_FROM.findall(text)}
         out.append((urls, _page_text(m.content), True))
     return out
 
@@ -213,9 +213,6 @@ def _fetch_results(messages: list[Message], fetch_tool: str) -> list[tuple[set[s
 def fetched_urls(messages: list[Message], fetch_tool: str) -> set[str]:
     """Normalized URLs of every successful ``fetch_tool`` call (see ``_fetch_results``)."""
     return {u for urls, _, good in _fetch_results(messages, fetch_tool) if good for u in urls}
-
-
-_PART_FROM = re.compile(r"^\[[^\]\n]*, from (https?://[^\s\]]+)\]$", re.M)
 
 
 def _cited_form(url: str) -> set[str]:
@@ -353,12 +350,34 @@ class AnswerGuardLLM:
                 )
         return None
 
+    def _reminder(self, messages: list[Message]) -> list[Message]:
+        """While required calls are missing, a short note after the history saying what is
+        still needed, so the model hears it before answering instead of after.
+
+        Sending a too-early answer back costs a whole extra model call. With #25's logging,
+        4 of 9 fleet runs had one: Research answered after one fetch (or none) and the
+        Analyst did the arithmetic in its head. The note is not kept in the history and
+        sits at the end, so the prompt prefix the model has already read stays the same.
+        It only states what is missing. A first wording ending "Until then, reply with a
+        tool call" made the Verifier fetch its three pages one per step; a second ("several
+        can go in one reply") made Research batch its searches and stop at the minimum."""
+        missing = missing_calls(messages, self.required)
+        if not missing:
+            return []
+        need = ", ".join(f"{n} more successful {t} call(s)" for t, n in missing.items())
+        return [
+            Message(
+                role="user",
+                content=f"(Status: before your final answer you need at least {need}.)",
+            )
+        ]
+
     def chat(self, messages: list[Message], tools: list[dict[str, Any]]) -> ChatResponse:
         if self.check_citations:
             # The agent compacts long histories, which can drop an early fetch's result, so
             # fetches seen on any earlier call count too (one guard serves one task).
             self.fetched |= fetched_urls(messages, self.check_citations)
-        resp = self.inner.chat(messages, tools)
+        resp = self.inner.chat([*messages, *self._reminder(messages)], tools)
         extra: list[Message] = []
         p_tok = c_tok = 0  # tokens of the replies sent back
         while not resp.message.tool_calls and self.nudges < self.max_nudges:

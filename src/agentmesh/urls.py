@@ -9,6 +9,9 @@ from __future__ import annotations
 import re
 
 _URL = re.compile(r"https?://[^\s\]\[)(<>\"'`,|]+")
+# A fetched Hugging Face card carries its config.json and the other way round, each under
+# a "[..., from <url>]" heading (webtools.with_model_config): both parts were fetched.
+PART_FROM = re.compile(r"^\[[^\]\n]*, from (https?://[^\s\]]+)\]$", re.M)
 
 
 def normalize_url(url: str) -> str:

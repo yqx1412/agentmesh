@@ -27,7 +27,7 @@ from agentmesh.access import GRANT, Grant, read_write_result
 from agentmesh.executor import TASK_ID, Cancelled, Progress, Runner, RunOutcome
 from agentmesh.numbers import TRIVIAL, numbers
 from agentmesh.spec import SANDBOX_TOOLS, AgentSpec
-from agentmesh.urls import PART_FROM, normalize_url, urls_in
+from agentmesh.urls import PART_FROM, normalize_url, strip_citations, urls_in
 
 
 class ProgressTracer(Tracer):
@@ -264,7 +264,9 @@ class AnswerGuardLLM:
     it quotes text no tool returned. The model is then asked again with one extra user
     message (not kept in
     the agent's history). After ``max_nudges`` the answer goes through anyway, so a tool that
-    keeps failing can't trap the task.
+    keeps failing can't trap the task -- except for citations: if the final answer (once the
+    budget is spent) still cites a page no fetch returned, the guard strips that citation
+    rather than ship it (see ``strip_citations`` and ``chat``).
 
     With a ``tracer``, every refusal is written to the trace as an ``answer_sent_back``
     event (the check, what it flagged, the refused reply and its tokens). The agent's own
@@ -444,6 +446,26 @@ class AnswerGuardLLM:
             c_tok += resp.completion_tokens
             extra += [resp.message, Message(role="user", content=problem.message)]
             resp = self.inner.chat([*messages, *extra], tools)
+        if self.check_citations and not resp.message.tool_calls:
+            # Last line of defence: the nudge budget is finite, so a model that keeps
+            # citing a page it never fetched (swapping one unfetched URL for another on each
+            # retry) eventually gets its answer through. Rather than ship that citation, drop
+            # it. A 2026-10-26 clean M6 run hit this: the guard caught the compacted
+            # neuralgist.com citation and spent all 3 nudges, then the model's final answer
+            # cited docs.ollama.com/context-length, a page it had only searched.
+            bad = unfetched_citations(resp.message.content, history, self.check_citations)
+            if bad:
+                cleaned = strip_citations(resp.message.content, bad)
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "citations_stripped",
+                        flagged=bad,
+                        nudge=self.nudges,
+                        content=resp.message.content,
+                    )
+                resp = resp.model_copy(
+                    update={"message": resp.message.model_copy(update={"content": cleaned})}
+                )
         if p_tok or c_tok:
             # M6: a refused reply still cost tokens; report them with the one the agent keeps.
             resp = resp.model_copy(

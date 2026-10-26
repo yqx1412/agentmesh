@@ -9,6 +9,7 @@ import httpx
 import pytest
 from agentos.config import AgentOSConfig, load_config
 from agentos.llm import ChatResponse, Message, ToolCall
+from agentos.memory import SUMMARY_NOTE
 from mcp.server.mcpserver.exceptions import ToolError
 
 from agentmesh import fleet
@@ -327,6 +328,72 @@ def test_citation_guard_sends_unfetched_citation_back_and_survives_compaction():
     assert "did not fetch successfully" in inner.seen[-1][-1].content
     # Off unless the spec names the fetch tool.
     assert AnswerGuardLLM(ScriptedLLM([bad])).chat([task], []).message is bad
+
+
+CARD_URL = "https://huggingface.co/Qwen/Qwen3-8B"
+
+
+def _compacted_ratio_history():
+    """The 2026-10-26 c-ollama-ratio run: Research fetched the Qwen3-8B card, then the agent
+    compacted its history into a user message carrying the clipped search results."""
+    system = Message(role="system", content="You are Research.")
+    task = Message(role="user", content="Ollama's default context below 24 GiB, and Qwen3-8B's?")
+    card = _fetch(
+        CARD_URL, json.dumps({"url": CARD_URL, "text": "Context Length: 32,768 natively"}), "a"
+    )
+    summary = Message(
+        role="user",
+        content=f"{SUMMARY_NOTE}\ntool web__web_search returned: "
+        '{"url": "https://neuralgist.com/ollama-4k-context-window", "snippet": "Ollama '
+        'defaults to a 4,096-token context window on most consumer GPUs."}',
+    )
+    return [system, task, *card], [system, task, summary]
+
+
+def test_guard_ignores_the_compaction_summary():
+    before, after = _compacted_ratio_history()
+    step = Message(role="assistant", tool_calls=[ToolCall(id="z", name="x", arguments={})])
+    answer = Message(
+        role="assistant",
+        content="Ollama's default is 4,096 tokens [https://neuralgist.com/ollama-4k-context-window].",
+    )
+    for kind in ("citations", "numbers"):
+        inner = ScriptedLLM([step, answer, ANSWER])
+        guard = AnswerGuardLLM(inner, **{f"check_{kind}": "fetch_url"})
+        guard.chat(before, [])  # a step that saw the fetch
+        assert guard.chat(after, []).message is ANSWER  # the cited answer was sent back
+        nudge = inner.seen[-1][-1].content
+        assert ("neuralgist.com" if kind == "citations" else "4,096") in nudge
+
+
+def test_guard_still_reads_pages_compaction_removed():
+    before, after = _compacted_ratio_history()
+    step = Message(role="assistant", tool_calls=[ToolCall(id="z", name="x", arguments={})])
+    right = Message(role="assistant", content=f"Qwen3-8B: 32,768 tokens [{CARD_URL}].")
+    wrong = Message(role="assistant", content=f"Qwen3-8B: 40,960 tokens [{CARD_URL}].")
+    inner = ScriptedLLM([step, wrong, right])
+    guard = AnswerGuardLLM(inner, {"fetch_url": 1}, check_numbers="fetch_url")
+    guard.chat(before, [])
+    # The card's text is gone from the history, but its 32,768 still counts and its
+    # 40,960 doesn't; and the fetch still counts as the required one.
+    assert guard.chat(after, []).message is right
+    assert "40,960" in inner.seen[-1][-1].content
+    assert guard.nudges == 1
+    assert guard._reminder(guard._history(after)) == []
+
+
+def test_guard_retry_cannot_pass_on_its_own_send_back():
+    # The send-back message names the flagged values, and it used to sit in the history
+    # the retry was checked against, as if the task had given them.
+    task = Message(role="user", content="Ollama's default context?")
+    card = _fetch(CARD_URL, json.dumps({"url": CARD_URL, "text": "Context Length: 32,768"}), "a")
+    bad = Message(role="assistant", content=f"4,096 tokens [{CARD_URL}] [https://x.example/]")
+    inner = ScriptedLLM([bad, bad, ANSWER])
+    for kind in ("numbers", "citations"):
+        inner = ScriptedLLM([bad, bad, ANSWER])
+        guard = AnswerGuardLLM(inner, **{f"check_{kind}": "fetch_url"})
+        assert guard.chat([task, *card], []).message is ANSWER
+        assert guard.nudges == 2
 
 
 def test_unfetched_numbers_reads_the_pages_each_claim_cites():

@@ -315,6 +315,57 @@ def test_guard_writes_each_send_back_to_the_trace(tmp_path):
     assert s["llm_calls"] == 2
 
 
+def test_guard_says_when_an_empty_reply_was_cut_off(tmp_path):
+    # 2026-10-26 rerun: in every a-weights run qwen3:14b spent all 2,048 tokens of its reply
+    # limit thinking ("7.7 or 7.70?"), so its reply was empty. Only done_reason shows that.
+    seen = []
+
+    class Inner:
+        model = "m"
+
+        def chat(self, messages, tools):
+            seen.append(messages)
+            first = len(seen) == 1
+            return ChatResponse(
+                message=Message(role="assistant", content="" if first else "7.70 GiB"),
+                prompt_tokens=1270,
+                completion_tokens=2048 if first else 500,
+                done_reason="length" if first else "stop",
+            )
+
+    trace = tmp_path / "analyst" / "t-1.jsonl"
+    resp = AnswerGuardLLM(Inner(), tracer=Tracer(trace)).chat(
+        [Message(role="user", content="q")], []
+    )
+    assert resp.message.content == "7.70 GiB"
+    assert "cut off at the length limit" in seen[1][-1].content
+    [event] = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    assert (event["check"], event["done_reason"]) == ("empty", "length")
+    assert event["flagged"] == ["cut off at the reply limit"]
+    # A kept reply that was cut off counts too (an over-long answer the guard let through).
+    with trace.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"event": "llm_response", "done_reason": "length"}) + "\n")
+        f.write(json.dumps({"event": "llm_response", "done_reason": "stop"}) + "\n")
+    s = trace_stats([trace])
+    assert (s["cut_off"], s["sent_back"]) == (2, {"empty": 1})
+
+
+def test_guard_keeps_the_plain_empty_reminder_without_a_done_reason():
+    # Older AgentOS replies, and other backends, have no done_reason.
+    seen = []
+
+    class Inner:
+        model = "m"
+
+        def chat(self, messages, tools):
+            seen.append(messages)
+            content = "" if len(seen) == 1 else "done"
+            return ChatResponse(message=Message(role="assistant", content=content))
+
+    AnswerGuardLLM(Inner()).chat([Message(role="user", content="q")], [])
+    assert seen[1][-1].content.startswith("Your reply was empty. Do the task now")
+
+
 def test_guard_without_a_tracer_or_a_refusal_writes_nothing(tmp_path):
     trace = tmp_path / "t.jsonl"
 
@@ -517,6 +568,11 @@ async def test_run_eval_streams_resumes_and_reports(tmp_path):
     assert "| Answers sent back by a check | none | none |" in text
     next(r for r in results if r.system == "multi").sent_back = {"citations": 2, "numbers": 1}
     assert "| Answers sent back by a check | none | 1 runs (citations 2, numbers 1) |" in (
+        report(results, tasks)
+    )
+    assert "| Replies cut off at the reply limit | none | none |" in text
+    next(r for r in results if r.system == "single").cut_off = 2
+    assert "| Replies cut off at the reply limit | 1 runs (2 replies) | none |" in (
         report(results, tasks)
     )
 

@@ -325,8 +325,21 @@ class AnswerGuardLLM:
         task = next(([m] for m in messages if m.role == "user"), [])
         return [*system, *task, *self.seen.values()]
 
-    def _problem(self, answer: str, messages: list[Message]) -> SendBack | None:
+    def _problem(
+        self, answer: str, messages: list[Message], done_reason: str = ""
+    ) -> SendBack | None:
         if not answer.strip():
+            if done_reason == "length":
+                # qwen3 with thinking on can spend the whole reply limit (num_predict)
+                # thinking and write nothing; in M6's a-weights it deliberated over "7.7"
+                # against "7.70" until it was cut off.
+                return SendBack(
+                    "empty",
+                    ["cut off at the reply limit"],
+                    "Your reply was cut off at the length limit while you were still "
+                    "thinking, so it was empty. Keep your reasoning short: call the tools "
+                    "the task needs, then reply with the result.",
+                )
             return SendBack(
                 "empty",
                 [],
@@ -410,8 +423,9 @@ class AnswerGuardLLM:
         p_tok = c_tok = 0  # tokens of the replies sent back
         while not resp.message.tool_calls and self.nudges < self.max_nudges:
             # A reply with tool calls ends the loop, so no tool result arrives in here: the
-            # history is the same for every retry.
-            problem = self._problem(resp.message.content, history)
+            # history _history built is the same for every retry.
+            done_reason = getattr(resp, "done_reason", "")
+            problem = self._problem(resp.message.content, history, done_reason)
             if problem is None:
                 break
             self.nudges += 1
@@ -424,6 +438,7 @@ class AnswerGuardLLM:
                     content=resp.message.content,
                     prompt_tokens=resp.prompt_tokens,
                     completion_tokens=resp.completion_tokens,
+                    done_reason=done_reason,
                 )
             p_tok += resp.prompt_tokens
             c_tok += resp.completion_tokens

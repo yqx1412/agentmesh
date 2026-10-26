@@ -59,7 +59,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "a2a-sdk", extras = ["http-server"], specifier = ">=1.2.1,<2" },
-    { name = "agentos", git = "https://github.com/yqx1412/agentos?rev=375e4b35ccd4d56a88b4cb78d9f0ca5c7053a7db" },
+    { name = "agentos", git = "https://github.com/yqx1412/agentos?rev=d1c8a366629840ede1ff822c76380ce4cbad8d94" },
     { name = "cryptography", specifier = ">=50.0.2,<51" },
     { name = "ddgs", specifier = "==9.16.0" },
     { name = "httpx", specifier = ">=0.28.1" },
@@ -81,7 +81,7 @@ dev = [
 [[package]]
 name = "agentos"
 version = "0.1.0"
-source = { git = "https://github.com/yqx1412/agentos?rev=375e4b35ccd4d56a88b4cb78d9f0ca5c7053a7db#375e4b35ccd4d56a88b4cb78d9f0ca5c7053a7db" }
+source = { git = "https://github.com/yqx1412/agentos?rev=d1c8a366629840ede1ff822c76380ce4cbad8d94#d1c8a366629840ede1ff822c76380ce4cbad8d94" }
 dependencies = [
     { name = "anyio" },
     { name = "httpx" },

@@ -585,6 +585,22 @@ counts the config.json that comes back with a Hugging Face card fetch as fetched
 Research's citation guard already did; one run citing it was scored as unfetched. Re-scored
 from their traces, the published M6 results are unchanged.
 
+In the 2026-10-26 full rerun, the Analyst's first reply on `a-weights` came back empty in all
+3 runs, and the guard sent it back each time. Replaying that call against Ollama showed
+why: qwen3:14b, thinking on, spent the whole 2,048-token reply limit (AgentOS's default
+`num_predict`) deciding whether the script's `7.7` meant the two-decimal `7.70`, and was
+cut off before writing anything. The Analyst's instructions now ask it to print rounded
+results with a format string at the precision asked for (`f"{x:.2f}"`); replayed with
+`7.70` printed, the same call answered in 539 tokens. AgentOS now keeps Ollama's
+`done_reason` on each reply and writes it to the trace; the guard's empty check says when
+a reply was cut off at the limit, and `agentmesh eval` counts such replies (`cut_off` in
+`results.jsonl`, a "Replies cut off at the reply limit" row; older traces read "none").
+Live, the 4 analysis and 3 composite tasks 3 times each on the fleet (21 runs): all passed,
+as in the rerun; `a-weights` had no send-backs (3 before), its median time fell from 122 s
+to 57 s and its tokens by 31%; over the 21 runs, model calls fell from 128 to 119 and
+tokens from 342k to 318k. No reply hit the limit. The single agent's spec is unchanged, to
+keep the M6 comparison.
+
 **Side-effect tasks** (`benchmarks/m6/tasks-side-effects.yaml`, outside the 16 M6 tasks so
 those numbers stay comparable) test what a run does, not only what it answers. Run them
 with `agentmesh eval run --tasks benchmarks/m6/tasks-side-effects.yaml`.

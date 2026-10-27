@@ -227,6 +227,22 @@ def test_trace_stats_counts_the_url_after_a_redirect(tmp_path):
     assert trace_stats([a])["fetched"] == [asked, final, "https://b.example"]
 
 
+def test_trace_stats_tallies_unverified_numbers_and_quotes(tmp_path):
+    # When the nudge budget is spent, the guard emits *_unverified for a number/quote it
+    # still flagged. These are not model calls of their own (unlike answer_sent_back).
+    a = _write(
+        tmp_path / "research" / "t-1.jsonl",
+        [
+            {"event": "llm_response", "prompt_tokens": 100, "completion_tokens": 10},
+            {"event": "numbers_unverified", "flagged": ["4,096"], "nudge": 3},
+            {"event": "quotes_unverified", "flagged": ['"not on any page"'], "nudge": 3},
+        ],
+    )
+    s = trace_stats([a])
+    assert s["unverified"] == {"numbers": 1, "quotes": 1}
+    assert s["llm_calls"] == 1  # the unverified flags are not extra model calls
+
+
 def test_trace_stats_counts_both_parts_of_a_hugging_face_fetch(tmp_path):
     # One card fetch returns the card and the model's config.json under "from <url>"
     # headings. Research's citation guard counts both; the eval scored a citation of the
@@ -315,6 +331,45 @@ def test_guard_writes_each_send_back_to_the_trace(tmp_path):
     s = trace_stats([trace])
     assert s["sent_back"] == {"empty": 1, "citations": 1}
     assert s["llm_calls"] == 2
+
+
+def test_guard_flags_an_unverified_number_after_the_nudge_budget_is_spent(tmp_path):
+    # Numbers are load-bearing, so unlike a citation the guard can't strip one. When the
+    # budget is spent and the answer still states a number no fetched page gives, the answer
+    # ships but the guard records numbers_unverified so the eval marks the run unverified.
+    page = Message(
+        role="tool",
+        tool_name="web__fetch_url",
+        tool_call_id="f1",
+        content=json.dumps({"url": "https://a.example/", "text": "The context is 32768 tokens."}),
+    )
+    call = Message(
+        role="assistant",
+        tool_calls=[
+            ToolCall(id="f1", name="web__fetch_url", arguments={"url": "https://a.example/"})
+        ],
+    )
+
+    class Inner:  # keeps citing a head dimension (5120) no fetched page states
+        model = "m"
+
+        def chat(self, messages, tools):
+            return ChatResponse(
+                message=Message(role="assistant", content="Head dimension: 5120"),
+                prompt_tokens=80,
+                completion_tokens=4,
+            )
+
+    trace = tmp_path / "research" / "t-2.jsonl"
+    guard = AnswerGuardLLM(Inner(), check_numbers="fetch_url", max_nudges=2, tracer=Tracer(trace))
+    resp = guard.chat([Message(role="user", content="q"), call, page], [])
+    assert resp.message.content == "Head dimension: 5120"  # shipped as-is
+    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    kinds = [e["event"] for e in events]
+    assert kinds[-1] == "numbers_unverified"  # after the sent-back nudges
+    assert events[-1]["flagged"] == ["5120"] and events[-1]["nudge"] == 2
+    s = trace_stats([trace])
+    assert s["unverified"] == {"numbers": 1}
 
 
 def test_guard_says_when_an_empty_reply_was_cut_off(tmp_path):
@@ -755,7 +810,9 @@ def procs(tmp_path):
             p.kill()
 
 
-async def _multi_cancel(tmp_path, procs, cancel: dict) -> tuple[RunRecord, object]:
+async def _multi_cancel(
+    tmp_path, procs, cancel: dict, policy: RunPolicy | None = None
+) -> tuple[RunRecord, object]:
     agent = procs("Research", "web_research", 20)
     agent.wait_up()
     task = _cancel_task(cancel, ["multi"])
@@ -768,7 +825,7 @@ async def _multi_cancel(tmp_path, procs, cancel: dict) -> tuple[RunRecord, objec
             ScriptedChat(plan(step("s1", "web_research", "Find Ollama's port"))),
             http,
             trace_root=root,
-            policy=RunPolicy(step_timeout=30),
+            policy=policy or RunPolicy(step_timeout=30),
             timeout=30,
             model_name="m",
         )
@@ -783,15 +840,13 @@ async def test_cancel_at_dispatch_stops_the_remote_task(tmp_path, procs):
     assert rec.passed, rec.checks
 
 
-async def test_cancel_at_dispatch_fails_when_the_cancel_misses_the_task(
-    tmp_path, procs, monkeypatch
-):
+async def test_cancel_at_dispatch_fails_when_the_cancel_misses_the_task(tmp_path, procs):
     # PR #19's bug, put back: the step stops waiting for the task id at once, so the
-    # remote task is never cancelled. The check must catch it.
-    import agentmesh.orchestrator as orch
-
-    monkeypatch.setattr(orch, "ID_WAIT", 0.0)
-    rec, _ = await _multi_cancel(tmp_path, procs, {"at": "dispatch"})
+    # remote task is never cancelled. The check must catch it. cancel_id_wait=0 reproduces
+    # the too-short wait that gave up before the id arrived.
+    rec, _ = await _multi_cancel(
+        tmp_path, procs, {"at": "dispatch"}, RunPolicy(step_timeout=30, cancel_id_wait=0.0)
+    )
     assert not rec.passed
     assert "remote_stopped" in {c["type"] for c in rec.checks if not c["ok"]}
 

@@ -203,12 +203,23 @@ class OllamaChat:
         think: bool = False,
         num_ctx: int = 16384,
         timeout: float = 600.0,
+        retry_delays: tuple[float, ...] = (0.5, 2.0),
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.model = model
         self.url = url.rstrip("/")
         self.think = think
         self.num_ctx = num_ctx
         self.timeout = timeout
+        self.transport = transport
+        # A failed request is retried after a short pause when it may pass on a resend:
+        # Ollama answers HTTP 5xx when its runner crashes (e.g. the CUDA illegal-memory
+        # access in the context-checkpoint path, ollama#17534) and starts a fresh runner
+        # for the next request. A planner/combine call is idempotent (temperature 0, no
+        # side effects), so a retry is safe. A 4xx (bad model name/request) fails at once.
+        # Mirrors domaingraph.llm's retry; AgentMesh previously had none, so one runner
+        # crash failed the whole run.
+        self.retry_delays = retry_delays
 
     async def __call__(
         self, messages: list[dict[str, str]], schema: dict[str, Any] | None = None
@@ -222,15 +233,35 @@ class OllamaChat:
         }
         if schema is not None:
             body["format"] = schema
-        async with httpx.AsyncClient(timeout=self.timeout) as http:
-            r = await http.post(f"{self.url}/api/chat", json=body)
-            r.raise_for_status()
-            data = r.json()
+        async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as http:
+            data = await self._post_retrying(http, body)
         return ChatReply(
             content=data["message"]["content"],
             prompt_tokens=int(data.get("prompt_eval_count") or 0),
             completion_tokens=int(data.get("eval_count") or 0),
         )
+
+    async def _post_retrying(self, http: httpx.AsyncClient, body: dict[str, Any]) -> dict[str, Any]:
+        tries = len(self.retry_delays) + 1
+        last: httpx.HTTPError | None = None
+        for i, delay in enumerate((*self.retry_delays, None)):
+            try:
+                r = await http.post(f"{self.url}/api/chat", json=body)
+                r.raise_for_status()
+                return r.json()
+            except httpx.HTTPStatusError as exc:
+                # 5xx (a crashed runner) may pass on resend; 4xx will not.
+                if exc.response.status_code < 500 or delay is None:
+                    if delay is None and i:
+                        raise httpx.HTTPError(f"{exc} (gave up after {tries} tries)") from exc
+                    raise
+                last = exc
+            except httpx.TransportError as exc:  # no connection yet / dropped: may pass
+                if delay is None:
+                    raise httpx.HTTPError(f"{exc} (gave up after {tries} tries)") from exc
+                last = exc
+            await asyncio.sleep(delay)  # type: ignore[arg-type]  # delay is not None here
+        raise last or AssertionError("unreachable")
 
 
 # --- the catalogue ---------------------------------------------------------------------
@@ -612,11 +643,17 @@ async def make_plan(
     done: frozenset[str] = frozenset(),
     taken: frozenset[str] = frozenset(),
     redo: frozenset[str] = frozenset(),
+    tokens: dict[str, int] | None = None,
 ) -> tuple[list[Step], list[dict[str, Any]]]:
     """A valid plan plus one record per model attempt. Raises PlanError after the last try.
 
     For a re-plan, ``earlier`` describes the steps so far (``replan_brief``), ``taken``
-    holds their ids and ``done`` the completed ones, which the new steps may use."""
+    holds their ids and ``done`` the completed ones, which the new steps may use.
+
+    ``tokens`` (the run's ``out.tokens``) is credited the instant each reply returns, before
+    the next ``await``. A cancel landing mid-plan then still records the tokens already
+    spent -- the caller's post-return fold never runs on the cancel path, so without this
+    a cancelled run reported zero planner tokens."""
     messages = [
         {"role": "system", "content": PLAN_PROMPT},
         {
@@ -629,6 +666,9 @@ async def make_plan(
     attempts: list[dict[str, Any]] = []
     for _ in range(PLAN_ATTEMPTS):
         reply = await chat(messages, schema)
+        if tokens is not None:
+            tokens["prompt"] += reply.prompt_tokens
+            tokens["completion"] += reply.completion_tokens
         record = {
             "content": reply.content,
             "prompt_tokens": reply.prompt_tokens,
@@ -818,6 +858,12 @@ class RunPolicy:
     fallback: bool = True
     push: PushReceiver | None = None  # follow tasks by push notification instead of a stream
     poll_every: float = 15.0  # push mode: ask the agent if nothing arrived for this long
+    # On cancel, how long a step waits for the agent to report its task id so the cancel can
+    # reach the remote task. The id is normally the agent's first reply (within ms), but a
+    # slow agent could still be mid-first-call when the cancel lands; a too-short wait gives
+    # up before the id arrives and the remote task keeps running uncancelled. 10s matches the
+    # fleet/eval cancel grace (fleet.stop, CancelAt.grace).
+    cancel_id_wait: float = 10.0
     # After the run, a step that failed with CANNOT (a missing input) sends the planner back
     # once per re-plan to add the steps that get what was missing (``replan_brief``).
     replans: int = 1
@@ -883,7 +929,7 @@ async def _attempt(
     try:
         finished, _ = await asyncio.wait({job}, timeout=policy.step_timeout)
     except asyncio.CancelledError:  # the orchestration was cancelled: stop the agent too
-        await asyncio.shield(_stop(job, step, skill, a, http, rec))
+        await asyncio.shield(_stop(job, step, skill, a, http, rec, policy))
         raise
     if finished:
         try:
@@ -900,7 +946,8 @@ async def _attempt(
 
 # How long a cancelled step waits for the agent to report its task id, so the cancel can
 # reach the remote task. The id is normally the agent's first reply, within milliseconds.
-ID_WAIT = 5.0
+# This is the default; a run can override it with RunPolicy.cancel_id_wait.
+ID_WAIT = 10.0
 
 
 async def _stop(
@@ -910,8 +957,10 @@ async def _stop(
     a: Attempt,
     http: httpx.AsyncClient,
     rec: Recorder,
+    policy: RunPolicy | None = None,
 ) -> None:
-    deadline = time.monotonic() + ID_WAIT
+    wait = policy.cancel_id_wait if policy is not None else ID_WAIT
+    deadline = time.monotonic() + wait
     while not a.task_id and not job.done() and time.monotonic() < deadline:
         await asyncio.sleep(0.02)
     if a.task_id and not job.done():
@@ -919,7 +968,7 @@ async def _stop(
     elif not a.task_id and not job.done():
         rec.state(
             "working",
-            message=f"{step.id}: {a.agent} gave no task id in {ID_WAIT:g} s; nothing to cancel",
+            message=f"{step.id}: {a.agent} gave no task id in {wait:g} s; nothing to cancel",
         )
     await _drop(job)
 
@@ -1115,6 +1164,7 @@ async def combine(
     chat: Chat,
     writes_off: list[str] | None = None,
     left_out: list[str] | None = None,
+    tokens: dict[str, int] | None = None,
 ) -> ChatReply:
     context_start = STEP_CONTEXT.split("{task}")[0]
     parts = []
@@ -1139,7 +1189,11 @@ async def combine(
             + "\n\n".join(parts),
         },
     ]
-    return await chat(messages, None)
+    reply = await chat(messages, None)
+    if tokens is not None:
+        tokens["prompt"] += reply.prompt_tokens
+        tokens["completion"] += reply.completion_tokens
+    return reply
 
 
 def ungrounded_citations(task: str, answer: str, results: dict[str, StepResult]) -> list[str]:
@@ -1348,14 +1402,11 @@ async def _orchestrate(
         return finish("failed", "no agents with skills were found", stop="no_agents")
 
     try:
-        out.plan, attempts = await make_plan(task, cards, catalogue, chat)
+        out.plan, attempts = await make_plan(task, cards, catalogue, chat, tokens=out.tokens)
     except PlanError as exc:
         return finish("failed", str(exc), stop="plan_error")
     except Exception as exc:
         return finish("failed", f"planner error: {type(exc).__name__}: {exc}", stop="error")
-    for a in attempts:
-        out.tokens["prompt"] += a["prompt_tokens"]
-        out.tokens["completion"] += a["completion_tokens"]
     rec.event(
         "llm_response",
         step=1,
@@ -1415,13 +1466,11 @@ async def _orchestrate(
                 done=done,
                 taken=frozenset(out.results),
                 redo=frozenset(r.step.skill for r in stuck),
+                tokens=out.tokens,
             )
         except PlanError as exc:
             rec.state("working", message=f"re-plan failed, keeping the first plan: {exc}")
             break
-        for a in attempts:
-            out.tokens["prompt"] += a["prompt_tokens"]
-            out.tokens["completion"] += a["completion_tokens"]
         rec.event(
             "llm_response",
             step=model_step,
@@ -1451,12 +1500,10 @@ async def _orchestrate(
 
     rec.state("working", message="combining the results")
     try:
-        reply = await combine(task, out.plan, out.results, chat, writes_off)
+        reply = await combine(task, out.plan, out.results, chat, writes_off, tokens=out.tokens)
     except Exception as exc:
         return finish("failed", f"combining failed: {type(exc).__name__}: {exc}", stop="error")
     out.answer = reply.content.strip()
-    out.tokens["prompt"] += reply.prompt_tokens
-    out.tokens["completion"] += reply.completion_tokens
     if missing := values_left_out(task, out.plan, out.results, catalogue, out.answer):
         # Asked once more with the values named; the second reply is kept only if it
         # leaves out fewer of them.
@@ -1465,12 +1512,12 @@ async def _orchestrate(
             message=f"the reply left out looked-up values ({', '.join(missing)}), asking again",
         )
         try:
-            again = await combine(task, out.plan, out.results, chat, writes_off, missing)
+            again = await combine(
+                task, out.plan, out.results, chat, writes_off, missing, tokens=out.tokens
+            )
         except Exception as exc:
             rec.state("working", message=f"asking again failed, keeping the first reply: {exc}")
         else:
-            out.tokens["prompt"] += again.prompt_tokens
-            out.tokens["completion"] += again.completion_tokens
             still = values_left_out(task, out.plan, out.results, catalogue, again.content)
             if len(still) < len(missing):
                 out.answer, reply = again.content.strip(), again

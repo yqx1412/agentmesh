@@ -470,6 +470,33 @@ class AnswerGuardLLM:
                 resp = resp.model_copy(
                     update={"message": resp.message.model_copy(update={"content": cleaned})}
                 )
+        if not resp.message.tool_calls and self.tracer is not None:
+            # Numbers and quotes are load-bearing -- a value or a passage, not decoration --
+            # so unlike a citation they cannot be stripped out without destroying the answer.
+            # When the nudge budget is spent and the final answer still carries a number no
+            # fetched page states, or a quote no tool returned, the answer ships as-is (it
+            # may be the model's honest best), but the record must not pretend it was
+            # verified. These flags let the eval mark the run unverified rather than counting
+            # a shipped-but-unchecked value as a clean pass -- the honesty principle behind
+            # the eval's ``citations_unscoreable``, applied to numbers and quotes.
+            if self.check_numbers:
+                bad_n = unfetched_numbers(resp.message.content, history, self.check_numbers)
+                if bad_n:
+                    self.tracer.emit(
+                        "numbers_unverified",
+                        flagged=bad_n,
+                        nudge=self.nudges,
+                        content=resp.message.content,
+                    )
+            if self.check_quotes:
+                bad_q = invented_quotes(resp.message.content, history)
+                if bad_q:
+                    self.tracer.emit(
+                        "quotes_unverified",
+                        flagged=bad_q,
+                        nudge=self.nudges,
+                        content=resp.message.content,
+                    )
         if p_tok or c_tok:
             # M6: a refused reply still cost tokens; report them with the one the agent keeps.
             resp = resp.model_copy(

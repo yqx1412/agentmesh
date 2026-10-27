@@ -11,12 +11,14 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from test_m3 import Fleet, ScriptedChat, answers, plan, step
 
 from agentmesh.executor import RunOutcome
 from agentmesh.orchestrator import (
     STEP_CONTEXT,
+    OllamaChat,
     PlanError,
     RunPolicy,
     build_catalogue,
@@ -714,3 +716,41 @@ async def test_a_second_reply_that_is_no_better_is_not_kept(tmp_path):
     out = await orchestrate(RATIO_TASK, await cards_of(fleet), chat, fleet.http, policy=NO_WAIT)
     assert out.answer == "4,096 tokens.\nRATIO: 8.0"
     assert len(chat.calls) == 3
+
+
+# --- OllamaChat retries a crashed runner -----------------------------------------------
+
+
+async def test_ollama_chat_retries_a_5xx_then_succeeds():
+    # Ollama answers HTTP 500 when its runner crashes (the CUDA context-checkpoint bug);
+    # it starts a fresh runner, so a resend of the idempotent call succeeds. Before this
+    # one runner crash failed the whole run.
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(500, text="CUDA error: an illegal memory access")
+        return httpx.Response(
+            200,
+            json={"message": {"content": "ok"}, "prompt_eval_count": 7, "eval_count": 2},
+        )
+
+    chat = OllamaChat("m", retry_delays=(0.0,), transport=httpx.MockTransport(handler))
+    reply = await chat([{"role": "user", "content": "q"}])
+    assert reply.content == "ok" and (reply.prompt_tokens, reply.completion_tokens) == (7, 2)
+    assert calls["n"] == 2  # failed once, retried once
+
+
+async def test_ollama_chat_does_not_retry_a_4xx():
+    # A 4xx (bad model name / request) will not pass on resend; fail at once.
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(404, text="model not found")
+
+    chat = OllamaChat("m", retry_delays=(0.0, 0.0), transport=httpx.MockTransport(handler))
+    with pytest.raises(httpx.HTTPStatusError):
+        await chat([{"role": "user", "content": "q"}])
+    assert calls["n"] == 1  # not retried

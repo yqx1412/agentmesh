@@ -311,6 +311,25 @@ def test_unfetched_citations_accepts_redirects_and_paired_pages():
     assert unfetched_citations(answer, [*redirected, *paired, *comma], "fetch_url") == []
 
 
+def test_citation_fetched_matches_a_clipped_url_but_not_a_longer_sibling():
+    from agentmesh.urls import citation_fetched
+
+    fetched = {
+        "https://llm-explorer.com/model/Qwen/Qwen3-8B-Base,1tYwQIFnS9Glv2oqwAPiGY",
+        "https://huggingface.co/Qwen/Qwen3-8B",
+    }
+    # Exact normalized equal.
+    assert citation_fetched("https://huggingface.co/Qwen/Qwen3-8B", fetched)
+    # _URL clips the cited URL at the comma; it still names the fetched page (the suffix is
+    # the only difference, at a clip boundary). This is the 2026-10-27 r-qwen-license case.
+    assert citation_fetched("https://llm-explorer.com/model/Qwen/Qwen3-8B-Base", fetched)
+    # Boundary safety: a stem that is a prefix NOT at a clip char is a different page.
+    assert not citation_fetched("https://huggingface.co/Qwen/Qwen3", fetched)
+    assert not citation_fetched("https://example.com/Base", {"https://example.com/Basement"})
+    # A genuinely unfetched page is still unfetched.
+    assert not citation_fetched("https://never.example/x", fetched)
+
+
 def test_citation_guard_sends_unfetched_citation_back_and_survives_compaction():
     task = Message(role="user", content="Qwen3-8B's license?")
     hf = _fetch("https://huggingface.co/Qwen/Qwen3-8B", '{"text": "Apache 2.0"}', "a")

@@ -27,7 +27,7 @@ from agentmesh.access import GRANT, Grant, read_write_result
 from agentmesh.executor import TASK_ID, Cancelled, Progress, Runner, RunOutcome
 from agentmesh.numbers import TRIVIAL, numbers
 from agentmesh.spec import SANDBOX_TOOLS, AgentSpec
-from agentmesh.urls import PART_FROM, normalize_url, strip_citations, urls_in
+from agentmesh.urls import PART_FROM, citation_fetched, normalize_url, strip_citations, urls_in
 
 
 class ProgressTracer(Tracer):
@@ -243,7 +243,11 @@ def unfetched_citations(answer: str, messages: list[Message], fetch_tool: str) -
     Research never fetched. Only a prompt rule asked for fetched citations."""
     given = {u for m in messages if m.role == "user" for u in urls_in(m.content)}
     fetched = fetched_urls(messages, fetch_tool)
-    return [u for u in urls_in(answer) if u not in fetched and u not in given and not _is_local(u)]
+    return [
+        u
+        for u in urls_in(answer)
+        if not citation_fetched(u, fetched) and u not in given and not _is_local(u)
+    ]
 
 
 @dataclasses.dataclass(frozen=True)

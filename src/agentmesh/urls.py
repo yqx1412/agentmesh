@@ -27,6 +27,30 @@ def urls_in(text: str) -> list[str]:
     return list(dict.fromkeys(normalize_url(u) for u in _URL.findall(text)))
 
 
+# Characters that end a URL's "stem": _URL stops the match at the first of these, so a URL
+# written with one in its path is extracted clipped. The fetched set, built from the fetch
+# tool's own url argument (not via _URL), keeps the whole thing -- so the clipped citation
+# never string-matches it. llm-explorer.com appends a ",<token>" to its model paths, which
+# is the case that bit: the answer cited .../Qwen3-8B-Base,1tY... but urls_in clipped it at
+# the comma to .../Qwen3-8B-Base, which the suffixed fetched URL did not equal.
+_STEM_END = (",", "(", ")", "[", "]", "|", "`")
+
+
+def citation_fetched(cited: str, fetched: set[str]) -> bool:
+    """Whether a cited URL names a fetched page: a normalized equal, or a prefix of a
+    fetched URL at a path boundary.
+
+    The prefix arm exists for a URL _URL clips (a ``,`` or bracket in the path, see
+    ``_STEM_END``): the citation comes out as the stem, so it is accepted when a fetched URL
+    starts with that stem followed by one of those clip characters -- i.e. the stem is the
+    whole URL up to where _URL stopped. The boundary check means ``.../Base`` matches
+    ``.../Base,token`` but never ``.../Basement``. ``cited`` and the ``fetched`` members are
+    already ``normalize_url``d by the callers."""
+    if cited in fetched:
+        return True
+    return any(f.startswith(cited) and f[len(cited) : len(cited) + 1] in _STEM_END for f in fetched)
+
+
 def strip_citations(answer: str, bad: list[str]) -> str:
     """Remove each unfetched URL in ``bad`` from ``answer``, taking any bracket, paren or
     separator that only wrapped it so no empty "[]" or dangling "[, ]" is left behind.

@@ -50,7 +50,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from agentmesh.access import read_write_result
 from agentmesh.client import TaskRun, ask, cancel, task_state
 from agentmesh.orchestrator import Chat, Orchestration, RunPolicy, orchestrate
-from agentmesh.urls import PART_FROM, normalize_url, urls_in
+from agentmesh.urls import PART_FROM, citation_fetched, normalize_url, urls_in
 
 SYSTEMS = ("single", "multi")
 
@@ -513,7 +513,8 @@ def finish_record(rec: RunRecord, task: EvalTask, trace_root: Path) -> RunRecord
         rec.calls_after_cancel = calls_after(remote, rec.cancelled_at)
     if task.cites:
         rec.cited = urls_in(rec.answer)
-        rec.unfetched_citations = [u for u in rec.cited if u not in set(rec.fetched)]
+        fetched = set(rec.fetched)
+        rec.unfetched_citations = [u for u in rec.cited if not citation_fetched(u, fetched)]
         # If the run cited pages but no located trace fetched anything, the fetch evidence
         # is missing (not the citations bad): the agents' traces weren't found under
         # trace_root. Flag it so the metric isn't read as "cited an unfetched page".

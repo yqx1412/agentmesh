@@ -437,6 +437,39 @@ async def test_single_run_is_scored_and_costed_from_its_trace(tmp_path):
     assert rec.passed and rec.state == "completed"
     assert rec.prompt_tokens == 500 and rec.tool_calls == 1
     assert rec.unfetched_citations == ["https://never.example/x"]
+    assert rec.citations_unscoreable is False
+
+
+async def test_citations_are_unscoreable_when_no_fetch_trace_is_found(tmp_path):
+    # The run cites a page but its located trace did no fetch_url at all -- the fetching
+    # agent's trace was not under trace_root (the eval's --trace-root didn't match the
+    # fleet's --trace-dir). cited - fetched would flag everything; the flag says so instead.
+    root = tmp_path / "traces"
+    fleet = Fleet(
+        tmp_path,
+        {
+            "Solo": (
+                9015,
+                "general",
+                tracing(
+                    root,
+                    "solo",
+                    "Port 11434 [https://docs.ollama.com/faq].",
+                    fetched=(),  # no fetch_url recorded in the trace the scorer finds
+                    tokens=500,
+                ),
+            )
+        },
+    )
+    cards, _ = await discover_all(fleet.urls, fleet.http)
+    rec = await run_single(TASK, cards[0], fleet.http, skill="general", timeout=20)
+    finish_record(rec, TASK, root)
+    assert rec.cited == ["https://docs.ollama.com/faq"]
+    assert rec.citations_unscoreable is True
+    # The report counts it apart, not as a run that cited an unfetched page.
+    text = report([rec])
+    assert "Citations unscoreable | 1 (fetch traces not found)" in text
+    assert "Runs citing an unfetched page | 0 of 0" in text
 
 
 async def test_multi_run_sums_every_agent_and_the_orchestrator(tmp_path):

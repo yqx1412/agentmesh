@@ -52,6 +52,7 @@ from agentmesh.client import PushReceiver, TaskRun, ask, ask_push, cancel, disco
 from agentmesh.journal import JOURNAL_NAME, JsonlJournal
 from agentmesh.numbers import TRIVIAL as _TRIVIAL
 from agentmesh.numbers import numbers as _numbers
+from agentmesh.urls import strip_citations, urls_in
 
 MAX_STEPS = 6
 PLAN_ATTEMPTS = 3
@@ -1141,6 +1142,28 @@ async def combine(
     return await chat(messages, None)
 
 
+def ungrounded_citations(task: str, answer: str, results: dict[str, StepResult]) -> list[str]:
+    """URLs the combined answer cites that no completed step's answer carries and the task
+    did not give -- citations the combiner invented or mangled.
+
+    The orchestrator never fetches; the pages live in the Research sub-run (a separate
+    process and trace), so the combiner has no fetched set of its own to check against. But
+    a Research sub-answer has already passed Research's own citation guard, so every URL it
+    carries is a page Research fetched. The combiner's job is to relay, not to source, so a
+    citation in the final answer that appears in no step result (and isn't one the user's
+    task supplied) is unsupported -- the combiner either hallucinated it or corrupted a real
+    one. Those are the citations to drop. This is the orchestrator analogue of Research's
+    ``AnswerGuardLLM`` citation check, which only governs Research's own replies; before
+    this the combined answer passed through no guard at all. A 2026-10-26 M6 run showed the
+    gap: Research fetched docs.ollama.com correctly, but the eval flagged the final answer's
+    citation because nothing re-checked the orchestrator's synthesis."""
+    grounded = set(urls_in(task))
+    for r in results.values():
+        if r.ok:
+            grounded.update(urls_in(r.answer))
+    return [u for u in urls_in(answer) if u not in grounded]
+
+
 def write_records(plan: list[Step], results: dict[str, StepResult]) -> str:
     """Every completed step's write record (see ``access.Grant.write_report``), in plan
     order, as one block for the end of the final answer. Empty when no step wrote."""
@@ -1453,6 +1476,13 @@ async def _orchestrate(
                 out.answer, reply = again.content.strip(), again
             if still:
                 rec.state("working", message=f"the reply still leaves out: {', '.join(still)}")
+    if ungrounded := ungrounded_citations(task, out.answer, out.results):
+        # Last line of defence on the combiner's synthesis: drop a citation no step result
+        # carries (so no agent fetched it) and the task did not give. Research guards its
+        # own replies, but the combined answer was unguarded; see ``ungrounded_citations``.
+        out.answer = strip_citations(out.answer, ungrounded)
+        rec.event("citations_stripped", flagged=ungrounded, content=reply.content)
+        rec.state("working", message=f"dropped unsupported citations: {', '.join(ungrounded)}")
     if records := write_records(out.plan, out.results):
         # Built by the Knowledge agent's code from add_fact's results, so the user sees
         # what was really stored even when the summary calls a duplicate "stored".

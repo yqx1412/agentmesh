@@ -602,6 +602,61 @@ def test_values_left_out_only_counts_looked_up_values_the_computation_used():
     assert values_left_out(RATIO_TASK, plan_, results, MATH_CAT, "8") == []
 
 
+def test_ungrounded_citations_flags_only_urls_no_step_carries():
+    from agentmesh.orchestrator import ungrounded_citations
+
+    results = _ran({"s1": LOOKED_UP, "s2": COMPUTED})
+    # docs.ollama.com/faq is in s1's answer -> grounded; neuralgist.com is in no step -> not.
+    answer = "4,096 vs 32,768 (https://docs.ollama.com/faq, https://neuralgist.com/x): 8 fit."
+    assert ungrounded_citations(RATIO_TASK, answer, results) == ["https://neuralgist.com/x"]
+    # A URL the task itself gave counts as grounded even if no step echoed it.
+    given = RATIO_TASK + " See https://neuralgist.com/x."
+    assert ungrounded_citations(given, answer, results) == []
+    # A failed step's answer does not ground a citation.
+    results["s1"].ok = False
+    assert set(ungrounded_citations(RATIO_TASK, answer, results)) == {
+        "https://docs.ollama.com/faq",
+        "https://neuralgist.com/x",
+    }
+
+
+async def test_combine_strips_a_citation_no_step_supports(tmp_path):
+    # The combiner cites a page no Research step fetched (here, carried in no step answer):
+    # the orchestrator guard drops it, since Research guards only its own replies.
+    calc = SkillSpec(id="calculate", name="calculate", description="computes", tags=["math"])
+    fleet = Fleet(
+        tmp_path,
+        {
+            "Research": (9001, "web_research", answers(LOOKED_UP)),
+            "Analyst": (9002, calc, answers(COMPUTED)),
+        },
+    )
+    # The combined reply cites the grounded docs.ollama.com AND an invented neuralgist.com.
+    combined = (
+        "Ollama's window is 4,096 tokens (https://docs.ollama.com/faq) and Qwen3-8B's is "
+        "32,768 (https://neuralgist.com/x); 8 fit.\nRATIO: 8.0"
+    )
+    chat = ScriptedChat(
+        plan(
+            step("s1", "web_research", "Find both values."),
+            step(
+                "s2",
+                "calculate",
+                "How many of Ollama's default windows fit in Qwen3-8B's native context? {{s1}}",
+                ["s1"],
+            ),
+        ),
+        combined,
+    )
+    out = await orchestrate(RATIO_TASK, await cards_of(fleet), chat, fleet.http, policy=NO_WAIT)
+    assert out.state == "completed", out.message
+    # The grounded citation survives; the unsupported one is gone, no empty brackets left.
+    assert "https://docs.ollama.com/faq" in out.answer
+    assert "neuralgist.com" not in out.answer
+    assert "()" not in out.answer and "( )" not in out.answer
+    assert "RATIO: 8.0" in out.answer
+
+
 async def test_a_reply_that_leaves_out_looked_up_values_is_asked_for_again(tmp_path):
     calc = SkillSpec(id="calculate", name="calculate", description="computes", tags=["math"])
     fleet = Fleet(

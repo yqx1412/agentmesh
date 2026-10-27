@@ -218,7 +218,7 @@ through the orchestrator. Full write-up:
 ```powershell
 uv run agentmesh up --trace-dir runs/fleet-traces
 uv run agentmesh serve agents/solo.toml --trace-dir runs/fleet-traces/solo
-uv run agentmesh eval run --out runs/m6/full --repeats 3   # resumable
+uv run agentmesh eval run --out runs/m6/full --repeats 3 --trace-root runs/fleet-traces   # resumable; match the fleet's --trace-dir
 uv run agentmesh eval report runs/m6/full
 ```
 
@@ -639,6 +639,31 @@ identity so two real results never merge and required-call counting is unchanged
 including ones compaction has since dropped. The compaction summary and the guard's own
 send-back message count as neither task-given nor fetched, so a reworded summary can't
 launder a bad citation and a retry can't pass on the values the send-back named.
+
+**The citation guard, finished end to end** (2026-10-27, PRs #31-#34; details and the
+matched-trace-root rerun in the
+[write-up](benchmarks/results/m6-single-vs-multi.md#citation-integrity-chain-2026-10-27)):
+
+- **A citation the nudge budget can't fix is stripped** (#31). `max_nudges` bounds
+  retries, so a model that keeps citing an unfetched page eventually gets through; when
+  the budget is spent and the final answer still cites one, the guard removes that
+  citation rather than ship it (`strip_citations`, a `citations_stripped` trace event).
+- **The orchestrator's combined answer is guarded too** (#32). `check_citations` is only
+  on Research, so the orchestrator could relay or invent a citation no step grounded; it
+  now drops any citation the final answer makes that no completed step's answer carries.
+  Same PR: `agentmesh eval` flags a run `citations_unscoreable` when it cited pages but no
+  located trace fetched anything — the citation metric was silently blaming every URL when
+  the eval's `--trace-root` didn't match the fleet's `--trace-dir`.
+- **The single agent got the same guard** (#33): `check_citations = "fetch_url"` in
+  `agents/solo.toml`. It only bites when the answer cites a URL, so solo's compute and
+  lecture-note tasks are unaffected. A focused live check saw it fire on every run.
+- **A comma- or bracket-bearing citation now matches its fetched entry** (#34). The URL
+  regex treats those as terminators, so such a URL was extracted clipped and mis-scored
+  as unfetched; `urls.citation_fetched` accepts a cited URL that is a prefix of a fetched
+  one at a clip-char boundary, used by both the guard and the scorer.
+
+A full rerun on `243dd32` with `--trace-root` matched to the fleet passed 48/48 with every
+cited page fetched and, for the first time, all fleet citations scoreable.
 
 ## Development
 

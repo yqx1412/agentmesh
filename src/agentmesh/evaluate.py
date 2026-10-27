@@ -458,6 +458,12 @@ class RunRecord(BaseModel):
     cited: list[str] = Field(default_factory=list)
     fetched: list[str] = Field(default_factory=list)
     unfetched_citations: list[str] = Field(default_factory=list)
+    # A cites run whose fetch evidence could not be located: it cited pages but no trace the
+    # scorer found performed any fetch_url, so cited - fetched flags everything and means
+    # nothing. Almost always the eval's --trace-root did not point at the fleet's --trace-dir
+    # (the orchestrator wrote one root, the agents another), so the agents' traces were
+    # missed. unfetched_citations is unreliable for such a run; the report counts it apart.
+    citations_unscoreable: bool = False
     task_ids: list[str] = Field(default_factory=list)
     traces: list[str] = Field(default_factory=list)
     started: str = ""
@@ -508,6 +514,10 @@ def finish_record(rec: RunRecord, task: EvalTask, trace_root: Path) -> RunRecord
     if task.cites:
         rec.cited = urls_in(rec.answer)
         rec.unfetched_citations = [u for u in rec.cited if u not in set(rec.fetched)]
+        # If the run cited pages but no located trace fetched anything, the fetch evidence
+        # is missing (not the citations bad): the agents' traces weren't found under
+        # trace_root. Flag it so the metric isn't read as "cited an unfetched page".
+        rec.citations_unscoreable = bool(rec.cited) and not rec.tools.get("fetch_url")
     rec.checks = score(task, rec.answer, rec)
     if task.cancel is not None:
         # A cancelled run has no answer to show; only its checks count.
@@ -845,7 +855,10 @@ def report(results: list[RunRecord], tasks: list[EvalTask] | None = None) -> str
     row("Runs passed", lambda rs: _pct(sum(r.passed for r in rs), len(rs)))
     row(
         "Passed, every cited page fetched",
-        lambda rs: _pct(sum(r.passed and not r.unfetched_citations for r in rs), len(rs)),
+        lambda rs: _pct(
+            sum(r.passed and not r.unfetched_citations for r in rs if not r.citations_unscoreable),
+            sum(1 for r in rs if not r.citations_unscoreable),
+        ),
     )
     row(
         "Checks passed",
@@ -859,11 +872,17 @@ def report(results: list[RunRecord], tasks: list[EvalTask] | None = None) -> str
     row("Mean A2A tasks", lambda rs: f"{_mean([r.agent_tasks or 1 for r in rs]):.1f}")
 
     def cites(rs: list[RunRecord]) -> str:
-        cited = [r for r in rs if r.cited]
+        cited = [r for r in rs if r.cited and not r.citations_unscoreable]
         bad = [r for r in cited if r.unfetched_citations]
         return f"{len(bad)} of {len(cited)}"
 
     row("Runs citing an unfetched page", cites)
+
+    def unscoreable(rs: list[RunRecord]) -> str:
+        n = sum(r.citations_unscoreable for r in rs)
+        return f"{n} (fetch traces not found)" if n else "none"
+
+    row("Citations unscoreable", unscoreable)
 
     def sent_back(rs: list[RunRecord]) -> str:
         by_check: Counter[str] = Counter()

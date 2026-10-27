@@ -471,7 +471,6 @@ async def test_a_cancel_without_any_task_id_gives_up_after_the_wait(tmp_path, mo
 
     monkeypatch.setattr(orch, "ask", never)
     monkeypatch.setattr(orch, "cancel", fake_cancel)
-    monkeypatch.setattr(orch, "ID_WAIT", 0.2)
     fleet = Fleet(tmp_path, {"Slow": (9346, "work", done("unused"))})
     job = asyncio.create_task(
         orchestrate(
@@ -479,7 +478,7 @@ async def test_a_cancel_without_any_task_id_gives_up_after_the_wait(tmp_path, mo
             await fleet.cards(),
             ScriptedChat(plan(("s1", "work", []))),
             fleet.http,
-            policy=RunPolicy(step_timeout=30),
+            policy=RunPolicy(step_timeout=30, cancel_id_wait=0.2),
         )
     )
     await asyncio.sleep(0.1)

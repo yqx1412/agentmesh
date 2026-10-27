@@ -298,6 +298,7 @@ def trace_stats(paths: list[Path]) -> dict[str, Any]:
         "tool_errors": 0,
         "tools": Counter(),
         "sent_back": Counter(),
+        "unverified": Counter(),
         "cut_off": 0,
         "fetched": [],
         "writes": [],
@@ -321,6 +322,12 @@ def trace_stats(paths: list[Path]) -> dict[str, Any]:
                 # already folded into the llm_response of the reply the agent kept).
                 s["llm_calls"] += 1
                 s["sent_back"][str(ev.get("check", "?"))] += 1
+            elif kind in ("numbers_unverified", "quotes_unverified"):
+                # The nudge budget was spent and the final answer still carried a number no
+                # fetched page states, or a quote no tool returned. The answer shipped as-is
+                # (these are load-bearing, not strippable like a citation), so the run is
+                # unverified rather than a clean pass -- not a model call of its own.
+                s["unverified"][kind.split("_")[0]] += 1
             elif kind == "llm_response":
                 s["llm_calls"] += 1
                 s["prompt_tokens"] += int(ev.get("prompt_tokens") or 0)
@@ -350,6 +357,7 @@ def trace_stats(paths: list[Path]) -> dict[str, Any]:
                     s["fetched"] += _result_parts(ev.get("output"))
     s["tools"] = dict(s["tools"])
     s["sent_back"] = dict(s["sent_back"])
+    s["unverified"] = dict(s["unverified"])
     s["fetched"] = list(dict.fromkeys(s["fetched"]))
     return s
 
@@ -449,6 +457,10 @@ class RunRecord(BaseModel):
     tools: dict[str, int] = Field(default_factory=dict)
     # answers an agent's guard sent back, by check (see runtime.AnswerGuardLLM)
     sent_back: dict[str, int] = Field(default_factory=dict)
+    # numbers/quotes the guard still flagged after the nudge budget was spent, so the answer
+    # shipped carrying an unverified value (load-bearing, not strippable like a citation).
+    # Keyed "numbers"/"quotes" (see runtime.AnswerGuardLLM's *_unverified trace events).
+    unverified: dict[str, int] = Field(default_factory=dict)
     # model replies the backend's reply limit cut off (done_reason "length"), sent back or kept
     cut_off: int = 0
     # multi only: the plan, and the A2A tasks the orchestrator sent (attempts included)
@@ -505,6 +517,7 @@ def finish_record(rec: RunRecord, task: EvalTask, trace_root: Path) -> RunRecord
     rec.prompt_tokens, rec.completion_tokens = st["prompt_tokens"], st["completion_tokens"]
     rec.tool_calls, rec.tool_errors, rec.tools = st["tool_calls"], st["tool_errors"], st["tools"]
     rec.sent_back = st["sent_back"]
+    rec.unverified = st["unverified"]
     rec.cut_off = st["cut_off"]
     rec.fetched = st["fetched"]
     rec.writes = st["writes"]
@@ -896,6 +909,21 @@ def report(results: list[RunRecord], tasks: list[EvalTask] | None = None) -> str
         return f"{runs} runs ({detail})"
 
     row("Answers sent back by a check", sent_back)
+
+    def unverified(rs: list[RunRecord]) -> str:
+        by_kind: Counter[str] = Counter()
+        for r in rs:
+            by_kind.update(r.unverified)
+        runs = sum(bool(r.unverified) for r in rs)
+        if not runs:
+            return "none"
+        detail = ", ".join(f"{k} {v}" for k, v in sorted(by_kind.items()))
+        return f"{runs} runs ({detail})"
+
+    # The nudge budget was spent and the final answer still carried an unfetched number or
+    # an invented quote. It shipped (load-bearing, unlike a citation), so the run is honest
+    # about being unverified rather than counted as a clean pass.
+    row("Shipped unverified numbers/quotes", unverified)
 
     def cut_off(rs: list[RunRecord]) -> str:
         runs = sum(bool(r.cut_off) for r in rs)

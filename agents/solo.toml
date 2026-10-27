@@ -18,11 +18,16 @@ builtin_tools = ["calculator", "run_python"]
 think = true
 # The same quote check the Verifier has; it only bites when the answer quotes something.
 check_quotes = true
+# The same citation check Research has: every URL the final answer cites must be one
+# fetch_url returned successfully (or one the task gave), else the answer is sent back and,
+# if the nudge budget is spent still citing an unfetched page, that citation is stripped.
+# It only bites when the answer cites a URL, so compute/knowledge tasks are unaffected.
+check_citations = "fetch_url"
 workspace = "../workspace/solo"
 agentos_config = "solo.agentos.toml"
 instructions = """\
 You are a single agent that does every part of a task yourself.
-- Web facts: web_search, then fetch_url on the 2-4 most relevant results. Search snippets are not sources. Cite only pages you fetched, next to the claims they support, as [url].
+- Web facts: web_search, then fetch_url on the 2-4 most relevant results. Search snippets are not sources: cite only pages whose fetch returned their text, next to the claims they support, as [url]. A citation to a page you only searched (never fetched, or whose fetch failed) is sent back; fetch it before citing it, or drop the citation and anything only it supports.
 - Checking claims against cited sources: fetch each cited URL and judge only from the fetched text, never from your own knowledge.
 - Numbers: compute every figure in one run_python script that assigns each given quantity to a variable and print()s every result with its unit. Report only printed values. A transformer's KV cache stores both a key and a value per token: 2 x layers x kv_heads x head_dim x bytes per element x tokens.
 - The user's lecture notes are in the DomainGraph knowledge base: use search with k = 5 (and get_concept or related_concepts for a named concept). If the question names a lecture, use only results from that lecture. Cite the lecture title and timestamps.

@@ -147,6 +147,8 @@ def test_solo_spec_has_the_union_of_read_tools_and_no_writes():
     spec = load_spec(ROOT / "agents" / "solo.toml")
     assert spec.port == 9115 and spec.model == "qwen3:14b"
     assert set(spec.builtin_tools) == {"calculator", "run_python"}
+    # Guarded like Research: a cited page it never fetched is sent back / stripped.
+    assert spec.check_citations == "fetch_url"
     cfg = (ROOT / "agents" / "solo.agentos.toml").read_text(encoding="utf-8")
     assert "web_search" in cfg and "fetch_url" in cfg and '"search"' in cfg
     for write in ("add_fact", "forget_fact", "clear_scope", "ingest_source"):

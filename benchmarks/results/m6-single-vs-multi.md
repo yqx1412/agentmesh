@@ -29,6 +29,15 @@ numbers checked in code), a third full rerun again passed 48/48 on the fleet wit
 cited page fetched, and 33/48 on the single agent. See
 [Third rerun](#third-rerun-2026-10-24).
 
+**Update, 2026-10-27:** the citation guard was finished off end to end (PRs #28-#34):
+compaction no longer launders a search hit into a citation, a citation the nudge budget
+can't fix is stripped, the orchestrator's combined answer is guarded too, the single
+agent got the same guard, and the eval stopped mis-scoring citations (both a trace-root
+footgun and a URL-comma clip). A matched-trace-root full rerun passed 48/48 on the fleet
+with every cited page fetched and all citations scoreable, and a focused solo check saw
+the new single-agent guard fire on every run. See
+[Citation-integrity chain](#citation-integrity-chain-2026-10-27).
+
 Raw data: [`m6/results.jsonl`](m6/results.jsonl) (one line per run, with the answer,
 check results, cost and fetched pages), [`m6/report.md`](m6/report.md) (all tables),
 [`m6/meta.json`](m6/meta.json). Tasks: [`../m6/tasks.yaml`](../m6/tasks.yaml).
@@ -418,13 +427,127 @@ it replied only `RATIO: 8.0` (0/3).
   exercised; nothing cancels a run in the eval either (#19). The earlier caveats still
   apply.
 
+## Citation-integrity chain (2026-10-27)
+
+The three reruns above each passed the fleet 48/48 with "every cited page fetched", but
+that line hid two separate weaknesses that later work exposed and closed. The first was a
+real hole in the guard; the rest were the guard not covering every path, and the eval
+mis-scoring citations so the metric couldn't be trusted. The seven PRs below finish the
+citation guard end to end. Unlike the earlier prompt tuning, these are code changes with
+unit tests, so they are not tuned to these 16 tasks.
+
+**What each PR fixed:**
+
+- **#28** — the required-calls reminder (a one-line status of what's still missing, shown
+  before the model answers) cut first-try required-call send-backs to zero on a 27-run
+  fleet baseline. Not a citation fix, but it shipped in the same batch.
+- **#29** (+ AgentOS #11) — the Analyst's output format and a `done_reason` the guard
+  needs to tell an empty-because-cut-off reply from an empty-because-nothing one.
+- **#30** — compaction was laundering a search hit into a citation. When AgentOS compacts
+  a long history it folds old tool results into one summary *user* message; a search hit
+  for `neuralgist.com` in that summary was then read as a URL the task itself gave, so the
+  citation check let it through. `AnswerGuardLLM._history` now reconstructs "what the task
+  gave" from the first user message plus the tool results the guard actually saw, never
+  the compaction summary.
+- **#31** — a citation the nudge budget can't fix is now stripped. `max_nudges` bounds
+  retries, so a model that keeps citing a page it never fetched (swapping one unfetched
+  URL for another each retry) eventually gets its answer through. When the budget is spent
+  and the final answer still cites an unfetched page, the guard removes that citation
+  (`strip_citations`) rather than ship it, and records a `citations_stripped` trace event.
+  Citations only — a bad number or quote is load-bearing in the sentence.
+- **#32** — the orchestrator's combined answer was unguarded. `check_citations` is only on
+  `research.toml`, so the orchestrator could relay or invent a citation no step grounded.
+  It now drops any citation the final answer makes that no completed step's answer carries
+  (and the task didn't give): a Research sub-answer has already passed Research's own
+  guard, so "cited by some step" is a sound ground truth without an A2A protocol change.
+  Same PR: the eval now flags a run `citations_unscoreable` when it cited pages but no
+  located trace did any `fetch_url` — the "cited an unfetched page" metric was silently
+  blaming every URL whenever the eval's `--trace-root` didn't match the fleet's
+  `--trace-dir` and the agents' fetch traces weren't found.
+- **#33** — the single agent got the same `check_citations = "fetch_url"` guard as
+  Research. It only bites when the answer cites a URL, so solo's compute and lecture-note
+  tasks are unaffected.
+- **#34** — a citation whose URL contains a comma or bracket (the `_URL` regex treats those
+  as terminators) was extracted clipped and never string-matched its fetched entry, so the
+  eval reported a phantom unfetched citation. `citation_fetched` now accepts a cited URL
+  that is a prefix of a fetched one at a clip-char boundary, used by both the guard and the
+  scorer so they agree.
+
+**The earlier 48/48s were partly an artifact.** A full rerun on `16c16b5` with the eval's
+`--trace-root` pointed at a fresh directory, while the fleet was already writing to
+`runs/fleet-traces`, scored the entire fleet `citations_unscoreable` (8 of 8 on a focused
+`c-ollama-ratio` batch): the orchestrator's own fetch set is empty — fetching happens in
+the Research A2A sub-process, in a different trace dir — so `cited - fetched` flagged
+everything the moment the agents' traces weren't found. #32's flag makes that visible
+instead of silent; the fix is to run the eval with `--trace-root` equal to the fleet's
+`--trace-dir`.
+
+**Matched-trace-root full rerun**, 16 tasks, 3 repeats per system, same timeouts and
+hardware, on `main` at `243dd32` (before #33/#34), with
+`--trace-root runs/fleet-traces` matching the fleet. Both systems restarted from that
+commit first.
+
+| | single, third rerun | multi, third rerun | single, now | multi, now |
+|---|---|---|---|---|
+| Runs passed | 33/48 | 48/48 | 36/48 | 48/48 |
+| Passed, every cited page fetched | 26/48 | 48/48 | 27/36* | 48/48 |
+| Citations unscoreable | — | — | 12 (single) | none |
+| Runs citing an unfetched page | 13 of 13 | 0 of 20 | 0 of 2* | 0 of 19 |
+| Composite passed | 5/9 | 9/9 | 6/9 | 9/9 |
+
+\* The single agent ran **unguarded** here (this rerun predates #33). 12 of its research
+runs cited a page they only searched (`fetched = 0`, only `web_search` in the trace), so
+the eval now marks those `citations_unscoreable` and scores the citation rate over the
+remaining scoreable runs rather than mislabelling them "cited an unfetched page". With the
+trace roots matched, **the fleet's citations were fully scoreable for the first time** and
+it still cited no unfetched page. The compaction case `c-ollama-ratio` rep 1 had its
+Research citation guard fire live (a `neuralgist.com` search hit caught post-compaction),
+which the earlier contaminated run had missed only because that worker was running stale
+pre-#30 code after a restart/`uv sync` race, not because #30 was wrong.
+
+**Solo guard-check**, after #33, on `main` at `83fc745`: the three research tasks that had
+been unguarded (`r-qwen-license`, `r-ollama-port`, `r-a2a-origin`), 2 repeats each.
+
+| run | before (#33 absent) | after (#33) |
+|---|---|---|
+| all 6 | `fetched = 0`, unscoreable, cited a searched page | guard fired (`answer_sent_back` citations, 6 of 6), `fetched = 1-5`, all scoreable |
+
+The single agent now behaves like Research: it tries to cite a searched page, the guard
+sends it back, and the model fetches the page before citing it. Four of the six ended with
+no unfetched citation; the other two kept one through nudge exhaustion — one of those was
+`http://localhost:11434` (an address the answer names, not a web page), and the other,
+`r-qwen-license` rep 0, was the `#34` comma-clip artifact: the cited llm-explorer URL *was*
+fetched, its `,<token>` suffix just made the clipped citation miss its fetched entry. #34
+makes that score correctly.
+
+**How to read it:**
+
+- **The guard is now verified live, not only by replay.** The third rerun's new checks
+  "weren't seen working" because no kept answer needed them; here the compaction guard
+  fired on `c-ollama-ratio` and the solo guard fired on all 6 runs. The `citations_stripped`
+  path is still only exercised by unit tests — no live run spent its whole nudge budget
+  still citing an unfetched page.
+- **These are code fixes with tests**, so unlike the prompt tuning in the earlier reruns
+  they aren't tuned to these 16 tasks. The guard, strip and match logic each have unit
+  tests (`tests/test_m2.py`, `tests/test_chained.py`, `tests/test_m6.py`).
+- **The matched-trace-root run is the one to trust for citations.** The earlier
+  "every cited page fetched 48/48" lines were only meaningful when the roots happened to
+  match; with #32 a mismatch now shows as `citations_unscoreable` rather than a false
+  pass or a false fail.
+- The earlier caveats (16 self-written tasks, repeats that aren't independent at
+  temperature 0, guards as a confound, tokens across two model sizes, read-only task set)
+  still apply.
+
 ## Reproducing
 
 ```powershell
 uv run agentmesh up --trace-dir runs/fleet-traces
 uv run agentmesh serve agents/solo.toml --trace-dir runs/fleet-traces/solo
-uv run agentmesh eval run --out runs/m6/full --repeats 3 --timeout 1200 --step-timeout 600
+uv run agentmesh eval run --out runs/m6/full --repeats 3 --timeout 1200 --step-timeout 600 --trace-root runs/fleet-traces
 uv run agentmesh eval report runs/m6/full
 ```
 
-Re-running `eval run` into the same folder resumes where it stopped.
+Pass `--trace-root` equal to the fleet's `--trace-dir` (both `runs/fleet-traces` above),
+or the eval won't find the agents' fetch traces and will score every citation
+`citations_unscoreable` (see the 2026-10-27 section). Re-running `eval run` into the same
+folder resumes where it stopped.

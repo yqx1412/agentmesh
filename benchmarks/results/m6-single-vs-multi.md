@@ -38,6 +38,16 @@ with every cited page fetched and all citations scoreable, and a focused solo ch
 the new single-agent guard fire on every run. See
 [Citation-integrity chain](#citation-integrity-chain-2026-10-27).
 
+**Update, 2026-10-28:** after PRs #35-#38 (the write-up and README caught up, then four
+robustness fixes: numbers/quotes left unverified at nudge exhaustion are now flagged
+rather than shipped silently, the early-cancel grace is configurable and aligned at 10 s,
+planner tokens survive a mid-run cancel, and the orchestrator retries Ollama's transient
+runner crash), a full rerun on the restarted fleet — with the
+[ollama#17534](https://github.com/ollama/ollama/issues/17534) CUDA-checkpoint workaround
+applied to Ollama's launch — passed 48/48 on the fleet and 34/48 on the single agent,
+with **0 CUDA errors across all 96 runs** and no run shipping an unverified number or
+quote. See [PR #38 robustness rerun](#pr-38-robustness-rerun-2026-10-28).
+
 Raw data: [`m6/results.jsonl`](m6/results.jsonl) (one line per run, with the answer,
 check results, cost and fetched pages), [`m6/report.md`](m6/report.md) (all tables),
 [`m6/meta.json`](m6/meta.json). Tasks: [`../m6/tasks.yaml`](../m6/tasks.yaml).
@@ -538,9 +548,112 @@ makes that score correctly.
   temperature 0, guards as a confound, tokens across two model sizes, read-only task set)
   still apply.
 
+## PR #38 robustness rerun (2026-10-28)
+
+The citation chain was done; this batch (#35-#38) caught the docs up and then closed four
+robustness gaps the earlier runs had either worked around or not surfaced. Unlike the
+prompt tuning in the first reruns, these are code changes with unit tests, so they are not
+tuned to these 16 tasks.
+
+**What each PR fixed:**
+
+- **#35, #36, #37** — docs only: the citation-integrity section was added to this write-up,
+  the README's citation chain was closed, and the README's sprawling "After M6" changelog
+  (~420 lines duplicating this write-up) was replaced with a short summary pointing here.
+- **#38** — four robustness fixes:
+  - **Numbers and quotes left unverified at nudge exhaustion are now flagged, not shipped
+    silently.** `max_nudges` bounds retries; #31 stripped a lingering *citation*, but a
+    number no fetched page states, or an invented quote, is load-bearing in the sentence
+    and can't be blanked. The guard now emits a `numbers_unverified` / `quotes_unverified`
+    trace event when the budget is spent and the value is still unverified, and the eval
+    reports a **"Shipped unverified numbers/quotes"** row — the same honesty principle as
+    #32's `citations_unscoreable`, rather than a silent pass.
+  - **The early-cancel grace is configurable and aligned.** A cancel that lands before the
+    remote task's id is known waited a fixed 5 s (`fleet.py`/`evaluate.py` used 10 s — the
+    values disagreed). It's now `RunPolicy.cancel_id_wait`, default 10 s, so a slow sub-agent
+    still gets cancelled rather than leaking a model call past the cancel.
+  - **Planner tokens survive a mid-run cancel.** `make_plan`/`combine` folded their token
+    usage into the outcome only after returning, so a `CancelledError` during a planner
+    call recorded zero planner tokens. They now credit the outcome the instant each reply
+    returns, before the next await, so cancel-path cost accounting is complete.
+  - **The orchestrator retries Ollama's transient runner crash.** Root cause, found this
+    round: [ollama#17534](https://github.com/ollama/ollama/issues/17534), a deterministic
+    `CUDA error: illegal memory access` in the context-checkpoint / prompt-cache path (not
+    OOM — the card had plenty of free VRAM). `OllamaChat` now retries a transient 5xx /
+    connection failure on the idempotent planner/combine call (a crashed runner restarts
+    for the next request), mirroring `domaingraph.llm`'s embedder retry. Previously one
+    runner crash failed the whole run.
+
+**The Ollama workaround is deployment, not code.** The code retry makes a crash
+*survivable*; the issue's verified workaround makes it *not happen*. The fleet's Ollama
+was restarted with `LLAMA_ARG_CACHE_RAM=0`, `LLAMA_ARG_CTX_CHECKPOINTS=0` (both pass
+through to the llama runner, not Ollama's own config keys) and `OLLAMA_NUM_PARALLEL=1`
+(which does show in Ollama's config dump, confirming the env block applied). These aren't
+hardcoded into AgentMesh — they're host-specific launch env.
+
+**Full rerun**, 16 tasks, 3 repeats per system, same timeouts and hardware, on `main` at
+`c1e57ad` with `--trace-root runs/fleet-traces` matching the fleet. Both systems and
+Ollama were restarted from that commit first, with the workaround env applied to Ollama.
+
+| | single, matched-root | multi, matched-root | single, now | multi, now |
+|---|---|---|---|---|
+| Runs passed | 36/48 | 48/48 | 34/48 | 48/48 |
+| Passed, every cited page fetched | 27/36* | 48/48 | 33/48 | 48/48 |
+| Checks passed | — | 78/78 | 59/78 | 78/78 |
+| Citations unscoreable | 12 (single) | none | none | none |
+| Runs citing an unfetched page | 0 of 2* | 0 of 19 | 1 of 12 | 0 of 20 |
+| Shipped unverified numbers/quotes | — | — | none | none |
+| CUDA errors (all 96 runs) | — | — | **0** | **0** |
+| Composite passed | 6/9 | 9/9 | 3/9 | 9/9 |
+
+\* The matched-root single agent ran before #33's guard here was fully exercised; its
+column is from the 2026-10-27 run for comparison.
+
+**Both #38 robustness fixes verified clean live.** Across all 96 runs there were
+**0 CUDA errors** — the checkpoint-crash workaround held, so the new `OllamaChat` retry
+was never even needed (nothing crashed to retry). The **"Shipped unverified
+numbers/quotes" row read `none`** for both systems — no run exhausted its nudge budget
+still carrying an unverified value.
+
+**Fleet: still a clean 48/48**, 9/9 composite, every cited page fetched, all citations
+scoreable, 0 citing an unfetched page — the whole citation chain holds on a fresh restart
+onto new code.
+
+**Single: 34/48** (was 36/48 at the matched-root run) — within live-web and model
+variance, not a regression. Citations are scoreable (the #33 guard worked: 18 single runs
+had citation send-backs forcing fetches), and only 1 of 12 research runs cited an
+unfetched page — the known `r-ollama-port` artifact, which cites `http://127.0.0.1:11434`,
+an address not a fetchable page. Its failures are the same structural kinds already
+documented: `r-mcp-definition` 0/3 (searches the lecture notes for "MCP" instead of the
+web), `k-table-doubling` 0/3 (timestamps outside the required window), and the composite
+`c-qwen-kv` / `c-ollama-ratio` 0/3 (computes the ratio but drops the `4096` intermediate
+value the check also wants — the chained-hand-off weakness the fleet's 9/9 composite
+avoids).
+
+**How to read it:**
+
+- **This run verifies robustness, not new eval numbers.** The pass counts are within
+  variance of the 2026-10-27 matched-root run; what it adds is live confirmation that
+  #38's two robustness fixes hold (zero CUDA crashes over 96 runs, zero unverified values
+  shipped) and that nothing regressed on the restart onto new code.
+- **The retry's happy path wasn't exercised,** because the env workaround meant nothing
+  crashed. The retry is covered by unit tests (`tests/test_chained.py`: a transient 5xx is
+  retried then succeeds, a 4xx fails immediately); here it only shows it doesn't get in the
+  way.
+- **The `numbers_unverified` / `quotes_unverified` strip path is also test-only so far** —
+  no live run spent its whole nudge budget still carrying an unverified number or quote, so
+  the row read `none` by not triggering, not by catching and flagging.
+- The earlier caveats (16 self-written tasks, repeats that aren't independent at
+  temperature 0, guards as a confound, tokens across two model sizes, read-only task set)
+  still apply.
+
 ## Reproducing
 
 ```powershell
+# Ollama: the CUDA-checkpoint-crash workaround (ollama#17534) — see the 2026-10-28 section
+$env:LLAMA_ARG_CACHE_RAM = "0"; $env:LLAMA_ARG_CTX_CHECKPOINTS = "0"; $env:OLLAMA_NUM_PARALLEL = "1"
+ollama serve
+
 uv run agentmesh up --trace-dir runs/fleet-traces
 uv run agentmesh serve agents/solo.toml --trace-dir runs/fleet-traces/solo
 uv run agentmesh eval run --out runs/m6/full --repeats 3 --timeout 1200 --step-timeout 600 --trace-root runs/fleet-traces
@@ -550,4 +663,6 @@ uv run agentmesh eval report runs/m6/full
 Pass `--trace-root` equal to the fleet's `--trace-dir` (both `runs/fleet-traces` above),
 or the eval won't find the agents' fetch traces and will score every citation
 `citations_unscoreable` (see the 2026-10-27 section). Re-running `eval run` into the same
-folder resumes where it stopped.
+folder resumes where it stopped. The three `LLAMA_ARG_*` / `OLLAMA_*` env vars above avoid
+the deterministic CUDA runner crash on the context-checkpoint path; without them a crash
+mid-run is now survivable (the orchestrator's `OllamaChat` retry) but not prevented.

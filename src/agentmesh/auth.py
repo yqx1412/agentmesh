@@ -321,8 +321,8 @@ def verify_attestation(
 
 # --- what a Verifier verdict supports ---------------------------------------------------
 
-_URL = re.compile(r"https?://[^\s\]\)>\"'<]+")
-_SUPPORTED = re.compile(r"^\s*(?:[-*]\s*)?\d+[.)]\s*\**\s*SUPPORTED\b")
+_URL = re.compile(r"<(https?://[^>\s\"']+)>|(https?://[^\s\]\)>\"'<]+)")
+_SUPPORTED = re.compile(r"^\s*(?:[-*]\s*)?(?:\d+[.)]\s*){1,2}\**\s*SUPPORTED\b")
 
 
 def norm_url(url: str) -> str:
@@ -345,7 +345,7 @@ def supported_sources(answer: str) -> Counter[str]:
     found: Counter[str] = Counter()
     for line in answer.splitlines():
         if _SUPPORTED.match(line):
-            for url in dict.fromkeys(norm_url(u) for u in _URL.findall(line)):
+            for url in dict.fromkeys(norm_url(g1 or g2) for g1, g2 in _URL.findall(line)):
                 found[url] += 1
     return found
 
@@ -368,6 +368,6 @@ def supported_claims(input: str, answer: str) -> list[tuple[str, str]]:
             continue
         n = _NUMBERED.match(line)[1]  # type: ignore[index]  # _SUPPORTED implies it
         evidence = f"{asked.get(n, '')} {_URL.sub(' ', line)}"
-        for url in dict.fromkeys(norm_url(u) for u in _URL.findall(line)):
+        for url in dict.fromkeys(norm_url(g1 or g2) for g1, g2 in _URL.findall(line)):
             out.append((url, evidence))
     return out

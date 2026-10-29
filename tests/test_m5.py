@@ -406,6 +406,49 @@ def test_only_supported_lines_count_as_sources():
     assert dict(supported_sources(text)) == {"https://a.example/x": 2}
 
 
+def test_supported_sources_accepts_angle_bracket_urls():
+    # Verifier sometimes wraps URLs in angle brackets: [<https://...>]
+    from agentmesh.auth import supported_claims as sc
+
+    text = (
+        '1. SUPPORTED - "in an AVL tree heights differ by at most one" [<https://en.wikipedia.org/wiki/AVL_tree>]\n'
+        '2. SUPPORTED - "balance factor is height difference" [<https://en.wikipedia.org/wiki/AVL_tree>]\n'
+        '3. CONTRADICTED - "wrong" [<https://other.example>]\n'
+    )
+    sources = supported_sources(text)
+    assert sources["https://en.wikipedia.org/wiki/AVL_tree"] == 2
+    assert "https://other.example" not in sources
+
+    claims = sc(
+        "1. claim a [<https://en.wikipedia.org/wiki/AVL_tree>]\n2. claim b [<https://en.wikipedia.org/wiki/AVL_tree>]\n",
+        text,
+    )
+    assert len(claims) == 2
+    assert all(url == "https://en.wikipedia.org/wiki/AVL_tree" for url, _ in claims)
+
+
+def test_supported_sources_accepts_double_numbered_lines():
+    # Verifier prepends its own line number when the orchestrator already numbered
+    # the claims, producing "1. 1. SUPPORTED - ..." -- both numbering patterns must match.
+    from agentmesh.auth import supported_claims as sc
+
+    text = (
+        '1. 1. SUPPORTED - "AVL trees are self-balancing BSTs" [https://en.wikipedia.org/wiki/AVL_tree]\n'
+        '2. 2. SUPPORTED - "balance factor is height difference" [https://en.wikipedia.org/wiki/AVL_tree]\n'
+        '3. 3. CONTRADICTED - "wrong claim" [https://other.example]\n'
+    )
+    sources = supported_sources(text)
+    assert sources["https://en.wikipedia.org/wiki/AVL_tree"] == 2
+    assert "https://other.example" not in sources
+
+    inp = (
+        "1. AVL trees are self-balancing BSTs [https://en.wikipedia.org/wiki/AVL_tree]\n"
+        "2. balance factor is height difference [https://en.wikipedia.org/wiki/AVL_tree]\n"
+    )
+    claims = sc(inp, text)
+    assert len(claims) == 2
+
+
 CLAIMS_IN = (
     "Check these claims:\n"
     "1. llama.cpp supports speculative decoding with a draft model. [https://a.example/doc]\n"

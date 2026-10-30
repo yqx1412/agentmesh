@@ -712,6 +712,8 @@ end-to-end testing with a real Verifier can find: the M6 benchmark's format is t
 uniform to hit either one, and unit tests on the regex alone wouldn't have caught the
 Verifier's natural output style.
 
+**Pipeline trace visualization:** [yqx1412.github.io/agent-ecosystem](https://yqx1412.github.io/agent-ecosystem/)
+
 ## Reproducing
 
 ```powershell

@@ -306,6 +306,7 @@ verdict format never hit: the live Verifier wraps source URLs as `[<url>]` (angl
 brackets) and double-numbers its output lines (`1. 1. SUPPORTED`). Both were fixed before
 the clean pass; 289 tests pass, ruff clean. Full write-up:
 [`benchmarks/results/m6-single-vs-multi.md`](benchmarks/results/m6-single-vs-multi.md#s1-end-to-end-demo-2026-10-29).
+Pipeline trace visualization: [yqx1412.github.io/agent-ecosystem](https://yqx1412.github.io/agent-ecosystem/).
 
 ## Development
 

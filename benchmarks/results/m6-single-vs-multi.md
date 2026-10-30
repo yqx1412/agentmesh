@@ -48,6 +48,12 @@ applied to Ollama's launch — passed 48/48 on the fleet and 34/48 on the single
 with **0 CUDA errors across all 96 runs** and no run shipping an unverified number or
 quote. See [PR #38 robustness rerun](#pr-38-robustness-rerun-2026-10-28).
 
+**Update, 2026-10-29:** the S1 end-to-end demo ran the full gap-find → research →
+verify → write pipeline on the live fleet and surfaced two auth.py Verifier-verdict parse
+gaps that the M6 benchmark's uniform verdict format had never hit. Both were fixed and
+merged (PR #40) before a clean demo pass stored four new AVL tree facts into DomainGraph
+through the full M5 security chain. See [S1 end-to-end demo](#s1-end-to-end-demo-2026-10-29).
+
 Raw data: [`m6/results.jsonl`](m6/results.jsonl) (one line per run, with the answer,
 check results, cost and fetched pages), [`m6/report.md`](m6/report.md) (all tables),
 [`m6/meta.json`](m6/meta.json). Tasks: [`../m6/tasks.yaml`](../m6/tasks.yaml).
@@ -646,6 +652,65 @@ avoids).
 - The earlier caveats (16 self-written tasks, repeats that aren't independent at
   temperature 0, guards as a confound, tokens across two model sizes, read-only task set)
   still apply.
+
+## S1 end-to-end demo (2026-10-29)
+
+S1 is the final showcase in `ROADMAP.md`: given the existing 10-lecture MIT 6.006 corpus
+already in DomainGraph (600 concepts, 3,293 facts, 2,214 relations), find concepts the
+knowledge base covers only from lecture notes with no web sources, research those gaps,
+verify the claims, and write the supported facts back through the full M5 security chain.
+
+The demo ran as a natural-language task to the orchestrator. No new agent code was
+written; the planner produced a four-step plan from the task text and the fleet executed
+it:
+
+| Step | Agent | Skill | Result |
+|---|---|---|---|
+| s1 | Knowledge | `knowledge_lookup` | AVL tree–related concepts (balance factor, rotation, rebalancing, height) have no web-sourced facts — confirmed knowledge gaps |
+| s2 | Research | `web_research` | Fetched Wikipedia and GeeksForGeeks; 4 claims with verbatim quotes and source URLs |
+| s3 | Verifier | `claim_verification` | All 4 claims SUPPORTED with verbatim quotes, signed by the Verifier key |
+| s4 | Knowledge | `knowledge_write` | Stored **4 new facts** (IDs 323–326) into DomainGraph, scope `knowledge` |
+
+**New facts written** (confirmed by querying `list_facts(scope='knowledge')` after the
+run):
+
+| ID | Fact | Source |
+|---|---|---|
+| 323 | The balance factor of a node is the height difference of its child subtrees | Wikipedia |
+| 324 | If a node's balance factor reaches ±2, the imbalance is repaired by rotation | Wikipedia |
+| 325 | Four rotation variants: LL, RR, LR, RL | GeeksForGeeks |
+| 326 | AVL tree height is O(log n), bounded by the golden ratio | Wikipedia |
+
+**Two auth.py bugs found and fixed (PR #40).** S1 was the first task to exercise the
+full M5 write gate end-to-end with a live Verifier producing its natural output. The M6
+benchmark tasks used a consistent single-prefix bare-URL verdict format; the live
+Verifier produced two forms those benchmark runs never hit:
+
+- **Angle-bracket URLs.** The Verifier wrapped source URLs as `[<https://...>]`.
+  `_URL`'s `>` stop-character extracted nothing from that form, so `supported_sources`
+  was empty and the write gate rejected every claim with "no claim with a source
+  SUPPORTED". Fixed: `_URL` now alternates between a `<url>` group (group 1) and a
+  bare-URL group (group 2); `findall` callers take the non-empty group.
+- **Double-numbered verdict lines.** The orchestrator numbers its claims (`1.`) and the
+  Verifier re-numbers its output lines (`1.`), producing `1. 1. SUPPORTED`. `_SUPPORTED`
+  required exactly one `\d+[.)]\s*` prefix and fell through on the double-numbered form.
+  Fixed: `{1,2}` quantifier.
+
+`agents/knowledge.toml` also raised `max_steps` from 12 to 20 (PR #40), giving the write
+step enough budget for a `recall_facts + add_fact` pair per claim without hitting the
+step ceiling.
+
+**289 tests pass (+3 over PR #38), ruff clean.** The new test cases cover `_URL`
+accepting `[<url>]`, `_SUPPORTED` accepting `1. 1. SUPPORTED`, and the Knowledge agent's
+`max_steps` budget.
+
+**What S1 proves.** The full pipeline — gap-find via the live knowledge graph, live web
+research, Verifier attestation, and M5-gated writes back into DomainGraph — works
+end-to-end without any new agent code, driven entirely by a natural-language task to the
+orchestrator. The two bugs PR #40 fixed are gaps in the M5 auth layer that only live
+end-to-end testing with a real Verifier can find: the M6 benchmark's format is too
+uniform to hit either one, and unit tests on the regex alone wouldn't have caught the
+Verifier's natural output style.
 
 ## Reproducing
 

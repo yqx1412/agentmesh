@@ -281,6 +281,32 @@ the Knowledge agent's trace, not the answer) and cancels (every remote task must
 `canceled` with no more than one model call after the cancel). Run with
 `agentmesh eval run --tasks benchmarks/m6/tasks-side-effects.yaml`.
 
+## S1: end-to-end demo
+
+The showcase milestone: given the 10-lecture MIT 6.006 algorithms corpus in DomainGraph
+(600 concepts, 3,293 facts, 2,214 relations), find concepts covered only by lecture notes
+with no web sources, research those gaps, verify the findings, and write the supported
+facts back through the full M5 security chain.
+
+```powershell
+# Prereqs: fleet up (uv run agentmesh up --trace-dir runs/fleet-traces),
+#          Neo4j and Ollama running
+uv run python runs/s1_run.py
+```
+
+The orchestrator plans and runs a four-step pipeline — Knowledge gap-find → Research →
+Verifier → Knowledge write — from a single natural-language task. No S1-specific agent
+code was written. The clean demo pass stored 4 new AVL tree facts into DomainGraph
+(IDs 323–326: balance factor definition, ±2 triggers rotation, four rotation variants
+LL/RR/LR/RL, height formula with golden-ratio bound), all gated through the M5
+Verifier-attestation write check.
+
+**Running S1 surfaced two auth.py parse gaps** (PR #40) that the M6 benchmark's uniform
+verdict format never hit: the live Verifier wraps source URLs as `[<url>]` (angle
+brackets) and double-numbers its output lines (`1. 1. SUPPORTED`). Both were fixed before
+the clean pass; 289 tests pass, ruff clean. Full write-up:
+[`benchmarks/results/m6-single-vs-multi.md`](benchmarks/results/m6-single-vs-multi.md#s1-end-to-end-demo-2026-10-29).
+
 ## Development
 
 ```powershell
